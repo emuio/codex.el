@@ -213,13 +213,31 @@
   (should (eq (lookup-key codex-command-map "[") #'codex-tmux-copy-mode))
   (should (eq (lookup-key codex-command-map "p") #'codex-tmux-copy-mode)))
 
+(ert-deftest codex-test-command-map-has-menu-binding ()
+  (should (eq (lookup-key codex-command-map "m") #'codex-menu)))
+
 (ert-deftest codex-test-command-map-refreshes-existing-keymap ()
   (let ((codex-command-map (make-sparse-keymap)))
     (define-key codex-command-map "c" #'ignore)
     (codex--define-command-map)
     (should (eq (lookup-key codex-command-map "c") #'codex))
+    (should (eq (lookup-key codex-command-map "m") #'codex-menu))
     (should (eq (lookup-key codex-command-map "[") #'codex-tmux-copy-mode))
     (should (eq (lookup-key codex-command-map "p") #'codex-tmux-copy-mode))))
+
+(ert-deftest codex-test-menu-errors-when-transient-is-missing ()
+  (let ((original-require (symbol-function 'require)))
+    (cl-letf (((symbol-function 'require)
+               (lambda (feature &optional filename noerror)
+                 (if (eq feature 'transient)
+                     nil
+                   (funcall original-require feature filename noerror)))))
+      (should-error (codex-menu) :type 'user-error))))
+
+(ert-deftest codex-test-menu-defines-prefix-when-transient-is-available ()
+  (skip-unless (require 'transient nil t))
+  (should (eq (codex--ensure-transient-menu) 'codex--menu))
+  (should (commandp 'codex--menu)))
 
 (ert-deftest codex-test-terminal-mode-has-shift-return-binding ()
   (should (equal codex-shift-return-sequence "\C-j"))
