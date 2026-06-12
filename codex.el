@@ -18,6 +18,7 @@
 (require 'diff-mode)
 (require 'project)
 (require 'subr-x)
+(require 'tabulated-list)
 
 (defvar eat-terminal)
 (defvar eat-term-name)
@@ -166,6 +167,16 @@ same terminal newline."
 (defcustom codex-dashboard-include-tmux-sessions t
   "When non-nil, include detected external Codex tmux sessions in dashboard."
   :type 'boolean
+  :group 'codex)
+
+(defcustom codex-dashboard-preview-lines 8
+  "Maximum tmux or buffer tail lines used to build dashboard previews."
+  :type 'integer
+  :group 'codex)
+
+(defcustom codex-dashboard-preview-width 80
+  "Maximum preview text characters shown in one dashboard row."
+  :type 'integer
   :group 'codex)
 
 (defcustom codex-tmux-codex-command-regexp
@@ -1323,11 +1334,17 @@ When Magit is not available, show `git diff' for the project instead."
 (defvar codex-dashboard-buffer-name "*Codex Dashboard*"
   "Name of the Codex dashboard buffer.")
 
+(defvar-local codex--dashboard-entry-map nil
+  "Hash table mapping tabulated list row ids to dashboard entries.")
+
 (defvar codex-dashboard-mode-map nil
   "Keymap for `codex-dashboard-mode'.")
 
-(unless codex-dashboard-mode-map
-  (setq codex-dashboard-mode-map (make-sparse-keymap))
+(defun codex--define-dashboard-mode-map ()
+  "Define Codex dashboard bindings, refreshing an existing keymap on reload."
+  (unless (keymapp codex-dashboard-mode-map)
+    (setq codex-dashboard-mode-map (make-sparse-keymap)))
+  (set-keymap-parent codex-dashboard-mode-map tabulated-list-mode-map)
   (define-key codex-dashboard-mode-map (kbd "RET") #'codex-dashboard-select)
   (define-key codex-dashboard-mode-map (kbd "TAB") #'codex-dashboard-preview)
   (define-key codex-dashboard-mode-map (kbd "g") #'codex-dashboard-refresh)
@@ -1335,14 +1352,27 @@ When Magit is not available, show `git diff' for the project instead."
   (define-key codex-dashboard-mode-map (kbd "q") #'codex-dashboard-quit)
   (define-key codex-dashboard-mode-map (kbd "r") #'codex-dashboard-refresh)
   (define-key codex-dashboard-mode-map (kbd "n") #'next-line)
-  (define-key codex-dashboard-mode-map (kbd "p") #'previous-line))
+  (define-key codex-dashboard-mode-map (kbd "p") #'previous-line)
+  codex-dashboard-mode-map)
 
-(define-derived-mode codex-dashboard-mode fundamental-mode "Codex Dashboard"
+(codex--define-dashboard-mode-map)
+
+(define-derived-mode codex-dashboard-mode tabulated-list-mode "Codex Dashboard"
   "Major mode for managing Codex instances."
-  (setq buffer-read-only t)
   (setq truncate-lines t)
   (setq-local cursor-type 'box)
-  (use-local-map codex-dashboard-mode-map))
+  (setq tabulated-list-format
+        [("Source" 10 t)
+         ("Instance/Session" 24 t)
+         ("Project" 18 t)
+         ("TermState" 14 t)
+         ("Updated" 10 t)
+         ("Preview" 80 t)
+         ("Directory" 48 t)])
+  (setq tabulated-list-padding 2)
+  (setq tabulated-list-sort-key (cons "Source" nil))
+  (setq tabulated-list-entries #'codex--dashboard-tabulated-entries)
+  (tabulated-list-init-header))
 
 (defun codex--dashboard-entries ()
   "Return dashboard entries for live buffers and external tmux sessions."
@@ -1368,9 +1398,186 @@ When Magit is not available, show `git diff' for the project instead."
             (codex--tmux-codex-panes)))))
     (append buffer-entries tmux-entries)))
 
+(defun codex--dashboard-clean-preview (text)
+  "Return TEXT as a single short dashboard preview string."
+  (let* ((plain (replace-regexp-in-string
+                 "[[:cntrl:]]+" " " (or text "")))
+         (plain (replace-regexp-in-string "[[:space:]]+" " " plain))
+         (plain (string-trim plain))
+         (width (max 0 (or codex-dashboard-preview-width 0))))
+    (cond
+     ((zerop width) "")
+     ((> (length plain) width)
+      (concat (substring plain 0 width) "..."))
+     (t plain))))
+
+(defun codex--last-nonempty-line (lines)
+  "Return the last non-empty string from LINES."
+  (cl-find-if (lambda (line)
+                (not (string-empty-p (string-trim line))))
+              (reverse lines)))
+
+(defun codex--tmux-capture-preview (session)
+  "Return a best-effort bounded preview for tmux SESSION."
+  (when (and session
+             (integerp codex-dashboard-preview-lines)
+             (> codex-dashboard-preview-lines 0))
+    (let* ((lines (codex--process-file-lines
+                   codex-tmux-program
+                   "capture-pane" "-p" "-J"
+                   "-S" (format "-%d" codex-dashboard-preview-lines)
+                   "-t" session))
+           (line (and lines (codex--last-nonempty-line lines))))
+      (when line
+        (codex--dashboard-clean-preview line)))))
+
+(defun codex--dashboard-nonempty-preview (text)
+  "Return TEXT when it contains visible preview content."
+  (and text
+       (not (string-empty-p text))
+       text))
+
+(defun codex--buffer-tail-preview (buffer)
+  "Return a best-effort bounded preview from BUFFER."
+  (when (and (buffer-live-p buffer)
+             (integerp codex-dashboard-preview-lines)
+             (> codex-dashboard-preview-lines 0))
+    (with-current-buffer buffer
+      (save-excursion
+        (save-restriction
+          (widen)
+          (goto-char (point-max))
+          (forward-line (- codex-dashboard-preview-lines))
+          (codex--dashboard-clean-preview
+           (buffer-substring-no-properties (point) (point-max))))))))
+
+(defun codex--dashboard-updated-string (&optional time)
+  "Return a short dashboard refresh timestamp for TIME."
+  (format-time-string "%H:%M:%S" (or time (current-time))))
+
+(defun codex--dashboard-project-name (directory)
+  "Return a project display name for DIRECTORY."
+  (if (and directory (not (string-empty-p directory)))
+      (file-name-nondirectory (directory-file-name directory))
+    "Unknown"))
+
+(defun codex--dashboard-buffer-process-state (buffer)
+  "Return honest terminal process state for Codex BUFFER."
+  (if (not (buffer-live-p buffer))
+      "dead-buffer"
+    (let ((process (with-current-buffer buffer
+                     (get-buffer-process buffer))))
+      (cond
+       ((and process (eq (process-status process) 'run))
+        "process-run")
+       (process
+        (format "process-%s" (process-status process)))
+       ((let ((session (codex--buffer-tmux-session buffer)))
+          (and session (codex--tmux-session-live-p session)))
+        "tmux-live")
+       (t "no-process")))))
+
+(defun codex--dashboard-entry-source (entry)
+  "Return the Source column text for dashboard ENTRY."
+  (pcase (plist-get entry :type)
+    ('buffer "buffer")
+    ('tmux "tmux")
+    (_ "unknown")))
+
+(defun codex--dashboard-entry-instance (entry)
+  "Return the Instance/Session column text for dashboard ENTRY."
+  (pcase (plist-get entry :type)
+    ('buffer
+     (let ((buffer (plist-get entry :buffer)))
+       (or (and (buffer-live-p buffer)
+                (codex--buffer-instance-name buffer))
+           "default")))
+    ('tmux
+     (or (plist-get entry :session) "unknown"))
+    (_ "unknown")))
+
+(defun codex--dashboard-entry-directory (entry)
+  "Return the Directory column text for dashboard ENTRY."
+  (pcase (plist-get entry :type)
+    ('buffer
+     (or (codex--buffer-directory (plist-get entry :buffer)) ""))
+    ('tmux
+     (or (plist-get entry :directory) ""))
+    (_ "")))
+
+(defun codex--dashboard-entry-term-state (entry)
+  "Return the TermState column text for dashboard ENTRY."
+  (pcase (plist-get entry :type)
+    ('buffer
+     (codex--dashboard-buffer-process-state (plist-get entry :buffer)))
+    ('tmux "tmux-live")
+    (_ "unknown")))
+
+(defun codex--dashboard-entry-preview (entry)
+  "Return the Preview column text for dashboard ENTRY."
+  (pcase (plist-get entry :type)
+    ('buffer
+     (let* ((buffer (plist-get entry :buffer))
+            (session (and (buffer-live-p buffer)
+                          (codex--buffer-tmux-session buffer)))
+            (tmux-preview (and session (codex--tmux-capture-preview session))))
+       (or (codex--dashboard-nonempty-preview tmux-preview)
+           (codex--buffer-tail-preview buffer)
+           "")))
+    ('tmux
+     (or (codex--tmux-capture-preview (plist-get entry :session)) ""))
+    (_ "")))
+
+(defun codex--dashboard-entry-vector (entry &optional updated)
+  "Return a tabulated-list vector for dashboard ENTRY.
+
+UPDATED is the dashboard snapshot timestamp shown in the row."
+  (let* ((directory (codex--dashboard-entry-directory entry))
+         (updated (or updated (codex--dashboard-updated-string))))
+    (vector
+     (codex--dashboard-entry-source entry)
+     (codex--dashboard-entry-instance entry)
+     (codex--dashboard-project-name directory)
+     (codex--dashboard-entry-term-state entry)
+     updated
+     (codex--dashboard-entry-preview entry)
+     directory)))
+
+(defun codex--dashboard-entry-id (entry index)
+  "Return a stable row id for dashboard ENTRY at INDEX."
+  (format "%s:%s:%s"
+          index
+          (codex--dashboard-entry-source entry)
+          (codex--dashboard-entry-instance entry)))
+
+(defun codex--dashboard-tabulated-entries ()
+  "Return tabulated-list rows for the Codex dashboard."
+  (let ((entries (codex--dashboard-entries))
+        (updated (codex--dashboard-updated-string))
+        (index 0)
+        (entry-map (make-hash-table :test 'equal))
+        rows)
+    (dolist (entry entries)
+      (let ((id (codex--dashboard-entry-id entry index)))
+        (puthash id entry entry-map)
+        (push (list id (codex--dashboard-entry-vector entry updated)) rows)
+        (setq index (1+ index))))
+    (setq codex--dashboard-entry-map entry-map)
+    (nreverse rows)))
+
+(defun codex--dashboard-insert-footer ()
+  "Insert dashboard help text below the tabulated rows."
+  (let ((inhibit-read-only t))
+    (goto-char (point-max))
+    (insert "\nTerminal/process state, not model turn state.")
+    (insert "\nRET select/attach  TAB preview  k kill  r/g refresh  q quit\n")))
+
 (defun codex-dashboard-get-entry-at-point ()
   "Return the dashboard entry referenced by the current line."
-  (get-text-property (line-beginning-position) 'codex-dashboard-entry))
+  (or (get-text-property (line-beginning-position) 'codex-dashboard-entry)
+      (when-let ((id (tabulated-list-get-id)))
+        (and codex--dashboard-entry-map
+             (gethash id codex--dashboard-entry-map)))))
 
 (defun codex-dashboard-get-buffer-at-point ()
   "Return the Codex buffer referenced by the current dashboard line."
@@ -1388,95 +1595,16 @@ When Magit is not available, show `git diff' for the project instead."
       (plist-get entry :session)
       (or (plist-get entry :directory) default-directory)))))
 
-(defun codex--format-dashboard-line (entry)
-  "Format a dashboard line for ENTRY."
-  (pcase (plist-get entry :type)
-    ('buffer
-     (let* ((buffer (plist-get entry :buffer))
-            (dir (codex--buffer-directory buffer))
-            (instance (or (codex--buffer-instance-name buffer) "default"))
-            (project-name (if dir
-                              (file-name-nondirectory (directory-file-name dir))
-                            "Unknown"))
-            (process (and (buffer-live-p buffer)
-                          (with-current-buffer buffer
-                            (get-buffer-process buffer))))
-            (status (if process
-                        (if (eq (process-status process) 'run)
-                            "running"
-                          (symbol-name (process-status process)))
-                      "no-process"))
-            (command (with-current-buffer buffer
-                       (cond
-                        ((and codex--tmux-target-session
-                              (derived-mode-p 'vterm-mode))
-                         "tmux")
-                        ((derived-mode-p 'vterm-mode) "vterm")
-                        ((bound-and-true-p eat-terminal) "eat")
-                        (process (process-name process))
-                        (t "")))))
-       (format "%-8s %-22s %-18s %-12s %-10s %s"
-               "buffer"
-               instance
-               project-name
-               status
-               command
-               (abbreviate-file-name (or dir "")))))
-    ('tmux
-     (let* ((session (plist-get entry :session))
-            (dir (plist-get entry :directory))
-            (project-name (if dir
-                              (file-name-nondirectory (directory-file-name dir))
-                            "Unknown"))
-            (command (or (plist-get entry :command) "tmux")))
-       (format "%-8s %-22s %-18s %-12s %-10s %s"
-               "tmux"
-               session
-               project-name
-               "detected"
-               command
-               (abbreviate-file-name (or dir "")))))
-    (_
-     (format "%-8s %-22s %-18s %-12s %-10s %s"
-             "unknown" "" "" "" "" ""))))
-
 ;;;###autoload
 (defun codex-dashboard ()
   "Open the Codex terminal dashboard."
   (interactive)
-  (let ((dashboard-buffer (get-buffer-create codex-dashboard-buffer-name))
-        (entries (codex--dashboard-entries)))
+  (let ((dashboard-buffer (get-buffer-create codex-dashboard-buffer-name)))
     (with-current-buffer dashboard-buffer
-      (let ((inhibit-read-only t))
-        (erase-buffer)
-        (insert (propertize "Codex Terminal Dashboard\n" 'face 'header-line))
-        (insert (propertize "Terminal/process state, not model turn state.\n" 'face 'shadow))
-        (insert (propertize (make-string 50 ?=) 'face 'shadow))
-        (insert "\n\n")
-        (if entries
-            (progn
-              (insert (format "%-8s %-22s %-18s %-12s %-10s %s\n"
-                              "Source" "Instance" "Project" "TermState" "Command" "Directory"))
-              (insert (propertize (make-string 104 ?-) 'face 'shadow))
-              (insert "\n")
-              (dolist (entry entries)
-                (let ((line-start (point)))
-                  (insert (codex--format-dashboard-line entry))
-                  (insert "\n")
-                  (put-text-property line-start (line-end-position)
-                                     'codex-dashboard-entry entry))))
-          (insert (propertize "No Codex terminal instances detected." 'face 'warning)))
-        (insert "\n\nKeybindings:")
-        (insert "\n  RET - Select or attach instance")
-        (insert "\n  TAB - Preview instance")
-        (insert "\n  k   - Kill instance")
-        (insert "\n  r/g - Refresh")
-        (insert "\n  q   - Quit")
-        (goto-char (point-min))
-        (when entries
-          (forward-line 5)))
       (codex-dashboard-mode)
-      (setq buffer-read-only t))
+      (tabulated-list-print t)
+      (codex--dashboard-insert-footer)
+      (goto-char (point-min)))
     (switch-to-buffer dashboard-buffer)))
 
 (defun codex-dashboard-select ()

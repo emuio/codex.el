@@ -99,6 +99,28 @@ than `codex-context-max-region-chars`.
 Inside a Codex terminal buffer, `Shift+Enter` sends the same newline sequence as
 `Ctrl+j`, which Codex CLI uses for multiline input in the composer.
 
+### Dashboard
+
+`M-x codex-dashboard` opens an Emacs-native tabulated list. Columns are
+sortable and show terminal/process metadata: Source, Instance/Session, Project,
+TermState, Updated, Preview, and Directory. `TermState` is intentionally limited
+to local terminal/process state such as `process-run`, `tmux-live`, or
+`no-process`; it is not model turn state.
+
+For tmux-backed sessions, the Preview column uses a bounded `tmux capture-pane`
+read. If tmux is unavailable or capture fails, the row remains usable with an
+empty preview.
+
+Dashboard keys:
+
+| Key | Action |
+| --- | --- |
+| `RET` | Select or attach the instance. |
+| `TAB` | Preview the instance buffer. |
+| `k` | Kill the buffer or tmux session after confirmation. |
+| `r`, `g` | Refresh the list. |
+| `q` | Quit the dashboard window. |
+
 ## Configuration
 
 Useful options:
@@ -111,6 +133,8 @@ Useful options:
 (setq codex-transcript-line-limit 2000)
 (setq codex-context-max-region-chars 4000)
 (setq codex-context-include-region-text t)
+(setq codex-dashboard-preview-lines 8)
+(setq codex-dashboard-preview-width 80)
 ```
 
 Set `codex-use-tmux` to `nil` to run Codex directly in the terminal backend:
