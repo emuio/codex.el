@@ -121,6 +121,15 @@ Set to nil to disable automatic trimming."
   :type 'integer
   :group 'codex)
 
+(defcustom codex-shift-return-sequence "\C-j"
+  "Terminal sequence sent for Shift+Return in Codex terminal buffers.
+
+Codex CLI accepts C-j as a multiline-input newline in the composer.  Emacs
+receives Shift+Return as an editor key event, so codex.el translates it to that
+same terminal newline."
+  :type 'string
+  :group 'codex)
+
 (defcustom codex-dashboard-include-tmux-sessions t
   "When non-nil, include detected external Codex tmux sessions in dashboard."
   :type 'boolean
@@ -172,6 +181,30 @@ Set to nil to disable automatic trimming."
 
 (codex--define-command-map)
 
+(defvar codex-terminal-mode-map nil
+  "Keymap active in Codex terminal buffers.")
+
+(defun codex--define-terminal-mode-map ()
+  "Define Codex terminal buffer bindings, refreshing keymap on reload."
+  (unless (keymapp codex-terminal-mode-map)
+    (setq codex-terminal-mode-map (make-sparse-keymap)))
+  (define-key codex-terminal-mode-map (kbd "S-<return>")
+              #'codex-send-shift-return)
+  (define-key codex-terminal-mode-map (kbd "S-RET")
+              #'codex-send-shift-return)
+  (define-key codex-terminal-mode-map (kbd "S-<kp-enter>")
+              #'codex-send-shift-return)
+  (define-key codex-terminal-mode-map (kbd "<S-kp-enter>")
+              #'codex-send-shift-return)
+  codex-terminal-mode-map)
+
+(codex--define-terminal-mode-map)
+
+(define-minor-mode codex-terminal-mode
+  "Minor mode for Codex terminal buffer key translations."
+  :lighter nil
+  :keymap codex-terminal-mode-map)
+
 (defun codex--normalize-directory (directory)
   "Return DIRECTORY as an expanded directory name."
   (file-name-as-directory (expand-file-name directory)))
@@ -204,6 +237,11 @@ Set to nil to disable automatic trimming."
 (defun codex--external-tmux-buffer-name (session)
   "Return the buffer name used to attach external tmux SESSION."
   (format "*codex-tmux:%s*" session))
+
+(defun codex--extract-tmux-session-from-buffer-name (buffer-name)
+  "Extract the external tmux session from Codex BUFFER-NAME."
+  (when (string-match "^\\*codex-tmux:\\([^*]+\\)\\*$" buffer-name)
+    (match-string 1 buffer-name)))
 
 (defun codex--command-switches (directory mode)
   "Build Codex CLI switches for DIRECTORY and MODE.
@@ -399,6 +437,14 @@ PROCESSES should be the output of `codex--list-processes'."
             (push pane result))))
       (nreverse result))))
 
+(defun codex--tmux-pane-for-session (session)
+  "Return the detected tmux pane for SESSION, if any."
+  (cl-find session
+           (codex--tmux-codex-panes)
+           :key (lambda (pane)
+                  (plist-get pane :session))
+           :test #'string=))
+
 (defun codex--vterm-entry-command-string (directory mode &optional instance-name)
   "Build the command sent to vterm for DIRECTORY, MODE, and INSTANCE-NAME."
   (if codex-use-tmux
@@ -461,18 +507,24 @@ PROCESSES should be the output of `codex--list-processes'."
   "Return the directory associated with Codex BUFFER."
   (with-current-buffer buffer
     (or codex--session-directory
-        (codex--extract-directory-from-buffer-name (buffer-name buffer)))))
+        (codex--extract-directory-from-buffer-name (buffer-name buffer))
+        (when-let* ((session (codex--extract-tmux-session-from-buffer-name
+                              (buffer-name buffer)))
+                    (pane (codex--tmux-pane-for-session session)))
+          (plist-get pane :directory)))))
 
 (defun codex--buffer-instance-name (buffer)
   "Return the instance name associated with Codex BUFFER."
   (with-current-buffer buffer
     (or codex--session-instance
-        (codex--extract-instance-name-from-buffer-name (buffer-name buffer)))))
+        (codex--extract-instance-name-from-buffer-name (buffer-name buffer))
+        (codex--extract-tmux-session-from-buffer-name (buffer-name buffer)))))
 
 (defun codex--buffer-tmux-session (buffer)
   "Return the tmux session associated with Codex BUFFER, if any."
   (with-current-buffer buffer
     (or codex--tmux-target-session
+        (codex--extract-tmux-session-from-buffer-name (buffer-name buffer))
         (when-let ((directory (codex--buffer-directory buffer)))
           (codex--tmux-session-name
            directory
@@ -583,6 +635,7 @@ When SIMPLE-FORMAT is non-nil, show just the instance name."
 (defun codex--setup-repl-faces ()
   "Apply Codex REPL faces in the current buffer."
   (buffer-face-set :inherit 'codex-repl-face)
+  (codex-terminal-mode 1)
   (when (fboundp 'face-remap-add-relative)
     (face-remap-add-relative 'nobreak-space :underline nil)))
 
@@ -716,6 +769,18 @@ DIRECTORY, MODE, and INSTANCE-NAME are passed to `codex--start-session'."
    ((bound-and-true-p eat-terminal)
     (eat-term-send-string eat-terminal string)
     (eat-term-send-string eat-terminal (kbd "RET")))
+   (t
+    (user-error "Current Codex buffer is not backed by vterm or eat"))))
+
+;;;###autoload
+(defun codex-send-shift-return ()
+  "Send Shift+Return to the current Codex terminal buffer."
+  (interactive)
+  (cond
+   ((derived-mode-p 'vterm-mode)
+    (vterm-send-string codex-shift-return-sequence))
+   ((bound-and-true-p eat-terminal)
+    (eat-term-send-string eat-terminal codex-shift-return-sequence))
    (t
     (user-error "Current Codex buffer is not backed by vterm or eat"))))
 
@@ -970,14 +1035,26 @@ intercepts `C-b ['."
             (process (and (buffer-live-p buffer)
                           (with-current-buffer buffer
                             (get-buffer-process buffer))))
-            (process-status (if process
-                                (symbol-name (process-status process))
-                              "No Process")))
-       (format "%-8s %-22s %-18s %-12s %s"
+            (status (if process
+                        (if (eq (process-status process) 'run)
+                            "running"
+                          (symbol-name (process-status process)))
+                      "no-process"))
+            (command (with-current-buffer buffer
+                       (cond
+                        ((and codex--tmux-target-session
+                              (derived-mode-p 'vterm-mode))
+                         "tmux")
+                        ((derived-mode-p 'vterm-mode) "vterm")
+                        ((bound-and-true-p eat-terminal) "eat")
+                        (process (process-name process))
+                        (t "")))))
+       (format "%-8s %-22s %-18s %-12s %-10s %s"
                "buffer"
                instance
                project-name
-               process-status
+               status
+               command
                (abbreviate-file-name (or dir "")))))
     ('tmux
      (let* ((session (plist-get entry :session))
@@ -986,15 +1063,16 @@ intercepts `C-b ['."
                               (file-name-nondirectory (directory-file-name dir))
                             "Unknown"))
             (command (or (plist-get entry :command) "tmux")))
-       (format "%-8s %-22s %-18s %-12s %s"
+       (format "%-8s %-22s %-18s %-12s %-10s %s"
                "tmux"
                session
                project-name
+               "detected"
                command
                (abbreviate-file-name (or dir "")))))
     (_
-     (format "%-8s %-22s %-18s %-12s %s"
-             "unknown" "" "" "" ""))))
+     (format "%-8s %-22s %-18s %-12s %-10s %s"
+             "unknown" "" "" "" "" ""))))
 
 ;;;###autoload
 (defun codex-dashboard ()
@@ -1010,9 +1088,9 @@ intercepts `C-b ['."
         (insert "\n\n")
         (if entries
             (progn
-              (insert (format "%-8s %-22s %-18s %-12s %s\n"
-                              "Source" "Instance" "Project" "Process" "Directory"))
-              (insert (propertize (make-string 92 ?-) 'face 'shadow))
+              (insert (format "%-8s %-22s %-18s %-12s %-10s %s\n"
+                              "Source" "Instance" "Project" "Status" "Command" "Directory"))
+              (insert (propertize (make-string 104 ?-) 'face 'shadow))
               (insert "\n")
               (dolist (entry entries)
                 (let ((line-start (point)))

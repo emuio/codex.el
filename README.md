@@ -17,6 +17,7 @@ session reuse, and a simple dashboard.
 - Manage live buffers and detected tmux sessions with `M-x codex-dashboard`.
 - Send a region, buffer, or one-line command to a running Codex session.
 - Enter tmux copy-mode from Emacs without typing the tmux prefix key.
+- Send Shift+Enter as a Codex CLI multiline-input newline in Codex terminal buffers.
 
 ## Requirements
 
@@ -70,6 +71,9 @@ With the example `C-c d` prefix above:
 | `C-c d s` | `codex-send-command` |
 | `C-c d [` | `codex-tmux-copy-mode` |
 | `C-c d p` | `codex-tmux-copy-mode` |
+
+Inside a Codex terminal buffer, `Shift+Enter` sends the same newline sequence as
+`Ctrl+j`, which Codex CLI uses for multiline input in the composer.
 
 ## Configuration
 
