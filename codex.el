@@ -15,6 +15,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'diff-mode)
 (require 'project)
 (require 'subr-x)
 
@@ -27,6 +28,7 @@
 (declare-function vterm-copy-mode "vterm")
 (declare-function vterm-send-return "vterm")
 (declare-function vterm-send-string "vterm")
+(declare-function magit-status "magit" (&optional directory))
 (defvar vterm-max-scrollback)
 
 (defgroup codex nil
@@ -40,6 +42,11 @@
 
 (defcustom codex-program "codex"
   "Program used to start Codex CLI."
+  :type 'string
+  :group 'codex)
+
+(defcustom codex-git-program "git"
+  "Program used to run git commands for Codex project helpers."
   :type 'string
   :group 'codex)
 
@@ -61,6 +68,18 @@
 
 (defcustom codex-tmux-session-prefix "codex"
   "Prefix used for tmux sessions created by codex.el."
+  :type 'string
+  :group 'codex)
+
+(defcustom codex-transcript-line-limit 2000
+  "Maximum number of tmux scrollback lines captured by `codex-capture-transcript'."
+  :type 'integer
+  :group 'codex)
+
+(defcustom codex-transcript-buffer-name-format "*codex-transcript:%s*"
+  "Format string for transcript buffer names.
+
+The tmux session name is passed as the only format argument."
   :type 'string
   :group 'codex)
 
@@ -198,6 +217,8 @@ same terminal newline."
   (define-key codex-command-map "b" #'codex-switch-to-buffer)
   (define-key codex-command-map "c" #'codex)
   (define-key codex-command-map "d" #'codex-dashboard)
+  (define-key codex-command-map "D" #'codex-project-diff)
+  (define-key codex-command-map "g" #'codex-project-magit-status)
   (define-key codex-command-map "k" #'codex-kill)
   (define-key codex-command-map "l" #'codex-login-status)
   (define-key codex-command-map "m" #'codex-menu)
@@ -206,6 +227,7 @@ same terminal newline."
   (define-key codex-command-map "R" #'codex-resume-last)
   (define-key codex-command-map "s" #'codex-send-command)
   (define-key codex-command-map "t" #'codex-toggle)
+  (define-key codex-command-map "T" #'codex-capture-transcript)
   (define-key codex-command-map "u" #'codex-yolo)
   (define-key codex-command-map "y" #'codex-send-return)
   (define-key codex-command-map "[" #'codex-tmux-copy-mode)
@@ -347,6 +369,18 @@ DIRECTORY and INSTANCE-NAME identify the Codex tmux session."
 (defun codex--tmux-copy-mode-target-args (session)
   "Return tmux arguments for entering copy-mode in SESSION."
   (list "copy-mode" "-t" session))
+
+(defun codex--tmux-capture-pane-args (session line-limit)
+  "Return tmux arguments to capture SESSION scrollback.
+
+LINE-LIMIT bounds how far back tmux reads from the pane history."
+  (list "capture-pane"
+        "-p"
+        "-J"
+        "-S"
+        (format "-%d" (max 1 (or line-limit 1)))
+        "-t"
+        session))
 
 (defun codex--tmux-attach-command-string (session)
   "Build the shell command used to attach tmux SESSION."
@@ -547,12 +581,22 @@ PROCESSES should be the output of `codex--list-processes'."
   (unless (require 'vterm nil t)
     (user-error "Package `vterm' is required for codex.el")))
 
+(defun codex--ensure-tmux-program ()
+  "Signal a user error unless tmux is available."
+  (unless (or (file-executable-p codex-tmux-program)
+              (executable-find codex-tmux-program))
+    (user-error "Cannot find tmux executable: %s" codex-tmux-program)))
+
 (defun codex--ensure-tmux ()
   "Signal a user error unless tmux is available."
   (when codex-use-tmux
-    (unless (or (file-executable-p codex-tmux-program)
-                (executable-find codex-tmux-program))
-      (user-error "Cannot find tmux executable: %s" codex-tmux-program))))
+    (codex--ensure-tmux-program)))
+
+(defun codex--ensure-git ()
+  "Signal a user error unless git is available."
+  (unless (or (file-executable-p codex-git-program)
+              (executable-find codex-git-program))
+    (user-error "Cannot find git executable: %s" codex-git-program)))
 
 (defun codex--codex-buffer-p (buffer)
   "Return non-nil when BUFFER is a Codex buffer."
@@ -594,6 +638,156 @@ PROCESSES should be the output of `codex--list-processes'."
                                (codex--tmux-pane-for-directory directory))))
       (or live-session
           (plist-get detected-pane :session)))))
+
+(defun codex--current-project-directory ()
+  "Return the project directory for the current Codex context."
+  (codex--normalize-directory
+   (or (and (codex--codex-buffer-p (current-buffer))
+            (codex--buffer-directory (current-buffer)))
+       (codex--directory))))
+
+(defun codex--tmux-session-entry-for-buffer (buffer)
+  "Return a tmux session entry for Codex BUFFER, if it has one."
+  (when-let ((session (codex--buffer-tmux-session buffer)))
+    (list :session session
+          :directory (codex--buffer-directory buffer)
+          :buffer buffer)))
+
+(defun codex--current-tmux-session-entry ()
+  "Return the tmux session entry for the current Codex buffer."
+  (when (codex--codex-buffer-p (current-buffer))
+    (codex--tmux-session-entry-for-buffer (current-buffer))))
+
+(defun codex--tmux-session-entries ()
+  "Return detected Codex tmux sessions as completion entries."
+  (let (seen result)
+    (cl-labels
+        ((add-entry
+          (entry)
+          (let ((session (plist-get entry :session)))
+            (when (and session (not (member session seen)))
+              (push session seen)
+              (push entry result)))))
+      (dolist (buffer (codex--find-all-codex-buffers))
+        (when-let ((entry (codex--tmux-session-entry-for-buffer buffer)))
+          (add-entry entry)))
+      (dolist (pane (codex--tmux-codex-panes))
+        (add-entry (list :session (plist-get pane :session)
+                         :directory (plist-get pane :directory)
+                         :pane-id (plist-get pane :pane-id)))))
+    (nreverse result)))
+
+(defun codex--format-tmux-session-entry (entry)
+  "Return a completion label for tmux session ENTRY."
+  (let* ((session (plist-get entry :session))
+         (directory (plist-get entry :directory))
+         (project-name (if directory
+                           (file-name-nondirectory
+                            (directory-file-name directory))
+                         "Unknown")))
+    (format "%s (%s) %s"
+            session
+            project-name
+            (abbreviate-file-name (or directory "")))))
+
+(defun codex--read-tmux-session-entry ()
+  "Prompt for a detected Codex tmux session entry."
+  (let ((entries (codex--tmux-session-entries)))
+    (unless entries
+      (user-error "No Codex tmux session found"))
+    (let* ((choices (mapcar (lambda (entry)
+                              (cons (codex--format-tmux-session-entry entry)
+                                    entry))
+                            entries))
+           (selection (completing-read "Codex tmux session: "
+                                       (mapcar #'car choices)
+                                       nil t)))
+      (cdr (assoc selection choices)))))
+
+(defun codex--select-tmux-session-entry (&optional force-prompt)
+  "Return a tmux session entry, prompting when FORCE-PROMPT is non-nil."
+  (or (and (not force-prompt)
+           (codex--current-tmux-session-entry))
+      (codex--read-tmux-session-entry)))
+
+(defun codex--transcript-buffer-name (session)
+  "Return the transcript buffer name for tmux SESSION."
+  (format codex-transcript-buffer-name-format session))
+
+(defun codex--tmux-capture-pane-output (session line-limit)
+  "Return captured tmux scrollback text for SESSION and LINE-LIMIT."
+  (with-temp-buffer
+    (let ((exit-code (apply #'process-file
+                            codex-tmux-program
+                            nil t nil
+                            (codex--tmux-capture-pane-args
+                             session line-limit))))
+      (unless (and (integerp exit-code) (zerop exit-code))
+        (user-error "tmux capture-pane failed for %s: %s"
+                    session
+                    (string-trim (buffer-string))))
+      (buffer-string))))
+
+(defun codex--transcript-buffer (session directory text line-limit)
+  "Return a read-only transcript buffer for SESSION containing TEXT.
+
+DIRECTORY and LINE-LIMIT are shown as capture metadata."
+  (let ((buffer (get-buffer-create (codex--transcript-buffer-name session))))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (propertize "Codex tmux transcript\n" 'face 'header-line))
+        (insert (format "Session: %s\n" session))
+        (when directory
+          (insert (format "Directory: %s\n" directory)))
+        (insert (format "Line limit: %d\n" (max 1 (or line-limit 1))))
+        (insert (format "Captured: %s\n\n"
+                        (format-time-string "%Y-%m-%d %H:%M:%S %z")))
+        (insert text)
+        (unless (bolp)
+          (insert "\n"))
+        (goto-char (point-min))
+        (special-mode)
+        (setq buffer-read-only t)))
+    buffer))
+
+(defun codex--git-diff-args (directory)
+  "Return git arguments for showing DIRECTORY diff."
+  (list "-C" (codex--normalize-directory directory) "diff" "--no-color"))
+
+(defun codex--git-diff-buffer-name (directory)
+  "Return the git diff buffer name for DIRECTORY."
+  (format "*codex-diff:%s*" (codex--normalize-directory directory)))
+
+(defun codex--git-diff-output (directory)
+  "Return `git diff' output for DIRECTORY."
+  (codex--ensure-git)
+  (with-temp-buffer
+    (let ((exit-code (apply #'process-file
+                            codex-git-program
+                            nil t nil
+                            (codex--git-diff-args directory))))
+      (unless (and (integerp exit-code) (zerop exit-code))
+        (user-error "git diff failed in %s: %s"
+                    (codex--normalize-directory directory)
+                    (string-trim (buffer-string))))
+      (buffer-string))))
+
+(defun codex--git-diff-buffer (directory)
+  "Return a read-only `git diff' buffer for DIRECTORY."
+  (let* ((dir (codex--normalize-directory directory))
+         (output (codex--git-diff-output dir))
+         (buffer (get-buffer-create (codex--git-diff-buffer-name dir))))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (if (string-empty-p output)
+                    "No differences.\n"
+                  output))
+        (goto-char (point-min))
+        (diff-mode)
+        (setq buffer-read-only t)))
+    buffer))
 
 (defun codex--find-all-codex-buffers ()
   "Return all live Codex buffers."
@@ -1024,6 +1218,44 @@ intercepts `C-b ['."
                     target-session)))
     (when buffer
       (codex--display-buffer buffer))))
+
+;;;###autoload
+(defun codex-capture-transcript (&optional arg)
+  "Capture bounded tmux scrollback for a Codex session.
+
+The captured transcript is shown in a read-only Emacs buffer, not in a
+terminal buffer.  With prefix ARG, always prompt for a detected Codex tmux
+session instead of using the current Codex buffer."
+  (interactive "P")
+  (codex--ensure-tmux-program)
+  (let* ((entry (codex--select-tmux-session-entry arg))
+         (session (plist-get entry :session))
+         (directory (plist-get entry :directory))
+         (output (codex--tmux-capture-pane-output
+                  session codex-transcript-line-limit))
+         (buffer (codex--transcript-buffer
+                  session directory output codex-transcript-line-limit)))
+    (pop-to-buffer buffer)
+    buffer))
+
+;;;###autoload
+(defun codex-project-diff ()
+  "Show `git diff' for the current Codex project."
+  (interactive)
+  (pop-to-buffer
+   (codex--git-diff-buffer (codex--current-project-directory))))
+
+;;;###autoload
+(defun codex-project-magit-status ()
+  "Open Magit status for the current Codex project.
+
+When Magit is not available, show `git diff' for the project instead."
+  (interactive)
+  (let ((directory (codex--current-project-directory)))
+    (if (require 'magit nil t)
+        (magit-status directory)
+      (message "Magit is not available; showing git diff instead")
+      (pop-to-buffer (codex--git-diff-buffer directory)))))
 
 ;;;###autoload
 (defun codex-login-status ()

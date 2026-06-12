@@ -63,6 +63,29 @@
                          "-t"
                          (codex--tmux-session-name "/tmp/project dir/" nil))))))
 
+(ert-deftest codex-test-tmux-capture-pane-args-target-session-and-limit ()
+  (should (equal (codex--tmux-capture-pane-args "codex-project" 123)
+                 '("capture-pane" "-p" "-J" "-S" "-123" "-t" "codex-project"))))
+
+(ert-deftest codex-test-transcript-buffer-name-uses-configured-format ()
+  (let ((codex-transcript-buffer-name-format "*Transcript:%s*"))
+    (should (equal (codex--transcript-buffer-name "codex-project")
+                   "*Transcript:codex-project*"))))
+
+(ert-deftest codex-test-transcript-buffer-is-read-only-plain-emacs-buffer ()
+  (let ((buffer (codex--transcript-buffer
+                 "codex-project" "/tmp/project/" "first line\nsecond line\n" 123)))
+    (unwind-protect
+        (with-current-buffer buffer
+          (should buffer-read-only)
+          (should-not (derived-mode-p 'vterm-mode))
+          (should-not (bound-and-true-p eat-terminal))
+          (should (save-excursion
+                    (goto-char (point-min))
+                    (search-forward "second line" nil t))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
 (ert-deftest codex-test-parse-tmux-pane-line ()
   (let ((pane (codex--parse-tmux-pane-line
                (mapconcat #'identity
@@ -211,7 +234,10 @@
 
 (ert-deftest codex-test-command-map-has-copy-mode-shortcuts ()
   (should (eq (lookup-key codex-command-map "[") #'codex-tmux-copy-mode))
-  (should (eq (lookup-key codex-command-map "p") #'codex-tmux-copy-mode)))
+  (should (eq (lookup-key codex-command-map "p") #'codex-tmux-copy-mode))
+  (should (eq (lookup-key codex-command-map "T") #'codex-capture-transcript))
+  (should (eq (lookup-key codex-command-map "D") #'codex-project-diff))
+  (should (eq (lookup-key codex-command-map "g") #'codex-project-magit-status)))
 
 (ert-deftest codex-test-command-map-has-menu-binding ()
   (should (eq (lookup-key codex-command-map "m") #'codex-menu)))
@@ -223,7 +249,10 @@
     (should (eq (lookup-key codex-command-map "c") #'codex))
     (should (eq (lookup-key codex-command-map "m") #'codex-menu))
     (should (eq (lookup-key codex-command-map "[") #'codex-tmux-copy-mode))
-    (should (eq (lookup-key codex-command-map "p") #'codex-tmux-copy-mode))))
+    (should (eq (lookup-key codex-command-map "p") #'codex-tmux-copy-mode))
+    (should (eq (lookup-key codex-command-map "T") #'codex-capture-transcript))
+    (should (eq (lookup-key codex-command-map "D") #'codex-project-diff))
+    (should (eq (lookup-key codex-command-map "g") #'codex-project-magit-status))))
 
 (ert-deftest codex-test-menu-errors-when-transient-is-missing ()
   (let ((original-require (symbol-function 'require)))
@@ -287,6 +316,24 @@
     (should (equal (codex--extract-directory-from-buffer-name name)
                    "/tmp/project/"))
     (should-not (codex--extract-instance-name-from-buffer-name name))))
+
+(ert-deftest codex-test-current-project-directory-prefers-codex-buffer-directory ()
+  (let ((buffer (get-buffer-create (codex--buffer-name "/tmp/project/"))))
+    (unwind-protect
+        (with-current-buffer buffer
+          (setq-local codex--session-directory "/tmp/project/")
+          (should (equal (codex--current-project-directory)
+                         "/tmp/project/")))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest codex-test-git-diff-args-use-project-directory ()
+  (should (equal (codex--git-diff-args "/tmp/project/")
+                 '("-C" "/tmp/project/" "diff" "--no-color"))))
+
+(ert-deftest codex-test-git-diff-buffer-name-uses-project-directory ()
+  (should (equal (codex--git-diff-buffer-name "/tmp/project/")
+                 "*codex-diff:/tmp/project/*")))
 
 (ert-deftest codex-test-display-buffer-full-frame-by-default ()
   (let ((buffer (get-buffer-create " *codex-display-test*")))
