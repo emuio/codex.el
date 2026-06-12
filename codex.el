@@ -24,6 +24,7 @@
 (declare-function eat-make "eat")
 (declare-function eat-term-send-string "eat")
 (declare-function vterm-mode "vterm")
+(declare-function vterm-copy-mode "vterm")
 (declare-function vterm-send-return "vterm")
 (declare-function vterm-send-string "vterm")
 (defvar vterm-max-scrollback)
@@ -196,6 +197,8 @@ same terminal newline."
               #'codex-send-shift-return)
   (define-key codex-terminal-mode-map (kbd "<S-kp-enter>")
               #'codex-send-shift-return)
+  (define-key codex-terminal-mode-map (kbd "C-c C-t")
+              #'codex-copy-mode)
   codex-terminal-mode-map)
 
 (codex--define-terminal-mode-map)
@@ -445,6 +448,28 @@ PROCESSES should be the output of `codex--list-processes'."
                   (plist-get pane :session))
            :test #'string=))
 
+(defun codex--same-directory-p (left right)
+  "Return non-nil when LEFT and RIGHT name the same directory."
+  (and left
+       right
+       (string= (file-truename (codex--normalize-directory left))
+                (file-truename (codex--normalize-directory right)))))
+
+(defun codex--tmux-pane-for-directory (directory)
+  "Return the detected tmux pane for DIRECTORY, if any."
+  (cl-find-if
+   (lambda (pane)
+     (codex--same-directory-p directory (plist-get pane :directory)))
+   (codex--tmux-codex-panes)))
+
+(defun codex--tmux-session-live-p (session)
+  "Return non-nil when tmux SESSION exists."
+  (and session
+       (let ((exit-code (process-file codex-tmux-program
+                                      nil nil nil
+                                      "has-session" "-t" session)))
+         (and (integerp exit-code) (zerop exit-code)))))
+
 (defun codex--vterm-entry-command-string (directory mode &optional instance-name)
   "Build the command sent to vterm for DIRECTORY, MODE, and INSTANCE-NAME."
   (if codex-use-tmux
@@ -523,12 +548,21 @@ PROCESSES should be the output of `codex--list-processes'."
 (defun codex--buffer-tmux-session (buffer)
   "Return the tmux session associated with Codex BUFFER, if any."
   (with-current-buffer buffer
-    (or codex--tmux-target-session
-        (codex--extract-tmux-session-from-buffer-name (buffer-name buffer))
-        (when-let ((directory (codex--buffer-directory buffer)))
-          (codex--tmux-session-name
-           directory
-           (codex--buffer-instance-name buffer))))))
+    (let* ((directory (codex--buffer-directory buffer))
+           (candidates
+            (delq nil
+                  (list codex--tmux-target-session
+                        (codex--extract-tmux-session-from-buffer-name
+                         (buffer-name buffer))
+                        (when directory
+                          (codex--tmux-session-name
+                           directory
+                           (codex--buffer-instance-name buffer))))))
+           (live-session (cl-find-if #'codex--tmux-session-live-p candidates))
+           (detected-pane (and directory
+                               (codex--tmux-pane-for-directory directory))))
+      (or live-session
+          (plist-get detected-pane :session)))))
 
 (defun codex--find-all-codex-buffers ()
   "Return all live Codex buffers."
@@ -917,6 +951,22 @@ With prefix ARG, prompt for instructions to prepend."
   (codex--send-command ""))
 
 ;;;###autoload
+(defun codex-copy-mode ()
+  "Enter the best copy mode for the current Codex terminal buffer."
+  (interactive)
+  (if (and codex-use-tmux
+           (codex--codex-buffer-p (current-buffer))
+           (codex--buffer-tmux-session (current-buffer)))
+      (codex-tmux-copy-mode)
+    (cond
+     ((derived-mode-p 'vterm-mode)
+      (vterm-copy-mode))
+     ((bound-and-true-p eat-terminal)
+      (user-error "No tmux session found; use the terminal backend copy mode"))
+     (t
+      (user-error "Current buffer is not a Codex terminal buffer")))))
+
+;;;###autoload
 (defun codex-tmux-copy-mode ()
   "Enter tmux copy-mode for the current Codex session.
 
@@ -1076,20 +1126,21 @@ intercepts `C-b ['."
 
 ;;;###autoload
 (defun codex-dashboard ()
-  "Open the Codex dashboard."
+  "Open the Codex terminal dashboard."
   (interactive)
   (let ((dashboard-buffer (get-buffer-create codex-dashboard-buffer-name))
         (entries (codex--dashboard-entries)))
     (with-current-buffer dashboard-buffer
       (let ((inhibit-read-only t))
         (erase-buffer)
-        (insert (propertize "Codex Dashboard\n" 'face 'header-line))
+        (insert (propertize "Codex Terminal Dashboard\n" 'face 'header-line))
+        (insert (propertize "Terminal/process state, not model turn state.\n" 'face 'shadow))
         (insert (propertize (make-string 50 ?=) 'face 'shadow))
         (insert "\n\n")
         (if entries
             (progn
               (insert (format "%-8s %-22s %-18s %-12s %-10s %s\n"
-                              "Source" "Instance" "Project" "Status" "Command" "Directory"))
+                              "Source" "Instance" "Project" "TermState" "Command" "Directory"))
               (insert (propertize (make-string 104 ?-) 'face 'shadow))
               (insert "\n")
               (dolist (entry entries)
@@ -1098,7 +1149,7 @@ intercepts `C-b ['."
                   (insert "\n")
                   (put-text-property line-start (line-end-position)
                                      'codex-dashboard-entry entry))))
-          (insert (propertize "No Codex instances running." 'face 'warning)))
+          (insert (propertize "No Codex terminal instances detected." 'face 'warning)))
         (insert "\n\nKeybindings:")
         (insert "\n  RET - Select or attach instance")
         (insert "\n  TAB - Preview instance")
@@ -1107,7 +1158,7 @@ intercepts `C-b ['."
         (insert "\n  q   - Quit")
         (goto-char (point-min))
         (when entries
-          (forward-line 4)))
+          (forward-line 5)))
       (codex-dashboard-mode)
       (setq buffer-read-only t))
     (switch-to-buffer dashboard-buffer)))

@@ -124,6 +124,24 @@
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
+(ert-deftest codex-test-buffer-tmux-session-falls-back-to-detected-directory ()
+  (let ((buffer (get-buffer-create (codex--buffer-name "/Users/emuio/.emacs.d/"))))
+    (unwind-protect
+        (with-current-buffer buffer
+          (setq-local codex--session-directory "/Users/emuio/.emacs.d/")
+          (setq-local codex--tmux-target-session "codex-emacs-d-1016e324")
+          (cl-letf (((symbol-function 'codex--tmux-session-live-p)
+                     (lambda (session)
+                       (string= session "emacs")))
+                    ((symbol-function 'codex--tmux-codex-panes)
+                     (lambda ()
+                       (list (list :session "emacs"
+                                   :directory "/Users/emuio/.emacs.d/"
+                                   :command "node")))))
+            (should (equal (codex--buffer-tmux-session buffer) "emacs"))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
 (ert-deftest codex-test-dashboard-format-buffer-without-process ()
   (let ((buffer (get-buffer-create (codex--buffer-name "/tmp/project/"))))
     (unwind-protect
@@ -213,6 +231,10 @@
               #'codex-send-shift-return))
   (should (eq (lookup-key codex-terminal-mode-map (kbd "<S-kp-enter>"))
               #'codex-send-shift-return)))
+
+(ert-deftest codex-test-terminal-mode-has-copy-mode-binding ()
+  (should (eq (lookup-key codex-terminal-mode-map (kbd "C-c C-t"))
+              #'codex-copy-mode)))
 
 (ert-deftest codex-test-vterm-entry-command-uses-tmux-when-enabled ()
   (let ((codex-use-tmux t))
