@@ -113,6 +113,19 @@ The tmux session name is passed as the only format argument."
   :type 'integer
   :group 'codex)
 
+(defcustom codex-context-max-region-chars 4000
+  "Maximum active-region characters included by `codex-send-context'."
+  :type 'integer
+  :group 'codex)
+
+(defcustom codex-context-include-region-text t
+  "When non-nil, `codex-send-context' can include small active-region text.
+
+Region text is included only when the region is active and no larger than
+`codex-context-max-region-chars'."
+  :type 'boolean
+  :group 'codex)
+
 (defcustom codex-max-buffer-size 80000
   "Maximum number of characters retained in Codex buffers.
 
@@ -215,6 +228,7 @@ same terminal newline."
   (unless (keymapp codex-command-map)
     (setq codex-command-map (make-sparse-keymap)))
   (define-key codex-command-map "b" #'codex-switch-to-buffer)
+  (define-key codex-command-map "C" #'codex-send-context)
   (define-key codex-command-map "c" #'codex)
   (define-key codex-command-map "d" #'codex-dashboard)
   (define-key codex-command-map "D" #'codex-project-diff)
@@ -1031,6 +1045,39 @@ DIRECTORY, MODE, and INSTANCE-NAME are passed to `codex--start-session'."
    (t
     (user-error "Current Codex buffer is not backed by vterm or eat"))))
 
+(defun codex--context-region-lines ()
+  "Return formatted active-region context lines for the current buffer."
+  (when (use-region-p)
+    (let* ((beg (region-beginning))
+           (end (region-end))
+           (length (- end beg)))
+      (when (<= length codex-context-max-region-chars)
+        (let ((lines (list (format "- Region: %d-%d (%d chars)"
+                                   beg end length))))
+          (if codex-context-include-region-text
+              (let* ((text (buffer-substring-no-properties beg end))
+                     (fence (if (string-match-p "```" text) "````" "```")))
+                (append lines
+                        (list "Selected text:"
+                              (concat fence "text")
+                              text
+                              fence)))
+            lines))))))
+
+(defun codex--format-context ()
+  "Return a concise context block for the current Emacs buffer."
+  (string-join
+   (append
+    (list "Emacs context:"
+          (format "- Buffer: %s" (buffer-name))
+          (format "- File: %s" (or buffer-file-name "none"))
+          (format "- Project/default directory: %s" (codex--directory))
+          (format "- Point: %d" (point))
+          (format "- Line: %d" (line-number-at-pos))
+          (format "- Column: %d" (current-column)))
+    (codex--context-region-lines))
+   "\n"))
+
 ;;;###autoload
 (defun codex-send-shift-return ()
   "Send Shift+Return to the current Codex terminal buffer."
@@ -1149,6 +1196,12 @@ With prefix ARG, switch to the Codex buffer after sending."
   (let ((buffer (codex--send-command command)))
     (when (and arg buffer)
       (switch-to-buffer buffer))))
+
+;;;###autoload
+(defun codex-send-context ()
+  "Send concise Emacs buffer context to a selected Codex session."
+  (interactive)
+  (codex--send-command (codex--format-context)))
 
 ;;;###autoload
 (defun codex-send-region (&optional arg)

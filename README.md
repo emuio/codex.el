@@ -17,6 +17,7 @@ session reuse, and a simple dashboard.
 - Manage live buffers and detected tmux sessions with `M-x codex-dashboard`.
 - Open a focused command menu with `M-x codex-menu` when `transient` is available.
 - Send a region, buffer, or one-line command to a running Codex session.
+- Send concise Emacs buffer context without sending entire large buffers.
 - Enter tmux copy-mode from Emacs without typing the tmux prefix key.
 - Capture bounded tmux scrollback into a normal read-only Emacs buffer.
 - Open `git diff` or Magit status for the current Codex project.
@@ -62,6 +63,7 @@ Common commands:
 | `codex-resume-last` | Run `codex resume --last` in the current project. |
 | `codex-yolo` | Start Codex with approval and sandbox bypass switches. |
 | `codex-send-region` | Send the active region, or the current buffer, to Codex. |
+| `codex-send-context` | Send current buffer, file, directory, point, line, column, and safe active-region context. |
 | `codex-send-command` | Send a one-line command to a selected Codex session. |
 | `codex-tmux-copy-mode` | Enter tmux copy-mode for the current Codex session. |
 | `codex-capture-transcript` | Capture bounded tmux scrollback into a read-only Emacs buffer. |
@@ -78,6 +80,7 @@ With the example `C-c d` prefix above:
 | `C-c d R` | `codex-resume-last` |
 | `C-c d u` | `codex-yolo` |
 | `C-c d r` | `codex-send-region` |
+| `C-c d C` | `codex-send-context` |
 | `C-c d s` | `codex-send-command` |
 | `C-c d [` | `codex-tmux-copy-mode` |
 | `C-c d p` | `codex-tmux-copy-mode` |
@@ -87,6 +90,11 @@ With the example `C-c d` prefix above:
 
 `codex-menu` loads `transient` lazily and signals a `user-error` if it is not
 installed; other commands keep working without it.
+
+`codex-send-context` sends a small text block describing the current Emacs
+buffer and location. If the region is active, selected text is included only
+when `codex-context-include-region-text` is non-nil and the region is no larger
+than `codex-context-max-region-chars`.
 
 Inside a Codex terminal buffer, `Shift+Enter` sends the same newline sequence as
 `Ctrl+j`, which Codex CLI uses for multiline input in the composer.
@@ -101,6 +109,8 @@ Useful options:
 (setq codex-display-full-frame t)
 (setq codex-vterm-max-scrollback 5000)
 (setq codex-transcript-line-limit 2000)
+(setq codex-context-max-region-chars 4000)
+(setq codex-context-include-region-text t)
 ```
 
 Set `codex-use-tmux` to `nil` to run Codex directly in the terminal backend:

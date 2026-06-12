@@ -268,6 +268,92 @@
   (should (eq (codex--ensure-transient-menu) 'codex--menu))
   (should (commandp 'codex--menu)))
 
+(ert-deftest codex-test-command-map-has-context-binding ()
+  (should (eq (lookup-key codex-command-map "C") #'codex-send-context)))
+
+(ert-deftest codex-test-format-context-includes-buffer-location ()
+  (with-temp-buffer
+    (rename-buffer "context-location-test" t)
+    (insert "first\nsecond\nthird\n")
+    (goto-char 9)
+    (setq buffer-file-name "/tmp/project/example.el")
+    (let ((default-directory "/tmp/project/"))
+      (cl-letf (((symbol-function 'codex--directory)
+                 (lambda () "/tmp/project/")))
+        (should
+         (equal (codex--format-context)
+                (string-join
+                 '("Emacs context:"
+                   "- Buffer: context-location-test"
+                   "- File: /tmp/project/example.el"
+                   "- Project/default directory: /tmp/project/"
+                   "- Point: 9"
+                   "- Line: 2"
+                   "- Column: 2")
+                 "\n")))))))
+
+(ert-deftest codex-test-format-context-includes-small-active-region ()
+  (with-temp-buffer
+    (rename-buffer "context-region-test" t)
+    (insert "alpha beta gamma")
+    (goto-char 1)
+    (push-mark 11 t t)
+    (let ((codex-context-include-region-text t)
+          (codex-context-max-region-chars 20)
+          (transient-mark-mode t)
+          (mark-active t))
+      (cl-letf (((symbol-function 'codex--directory)
+                 (lambda () "/tmp/project/")))
+        (should
+         (equal (codex--format-context)
+                (string-join
+                 '("Emacs context:"
+                   "- Buffer: context-region-test"
+                   "- File: none"
+                   "- Project/default directory: /tmp/project/"
+                   "- Point: 1"
+                   "- Line: 1"
+                   "- Column: 0"
+                   "- Region: 1-11 (10 chars)"
+                   "Selected text:"
+                   "```text"
+                   "alpha beta"
+                   "```")
+                 "\n")))))))
+
+(ert-deftest codex-test-format-context-omits-large-region-text ()
+  (with-temp-buffer
+    (insert "0123456789abcdef")
+    (goto-char 1)
+    (push-mark (point-max) t t)
+    (let ((codex-context-include-region-text t)
+          (codex-context-max-region-chars 5)
+          (transient-mark-mode t)
+          (mark-active t))
+      (cl-letf (((symbol-function 'codex--directory)
+                 (lambda () "/tmp/project/")))
+        (let ((context (codex--format-context)))
+          (should-not (string-match-p "Region:" context))
+          (should-not (string-match-p "Selected text:" context))
+          (should-not (string-match-p "0123456789abcdef" context)))))))
+
+(ert-deftest codex-test-format-context-respects-region-text-toggle ()
+  (with-temp-buffer
+    (rename-buffer "context-region-toggle-test" t)
+    (insert "short text")
+    (goto-char 1)
+    (push-mark (point-max) t t)
+    (let ((codex-context-include-region-text nil)
+          (codex-context-max-region-chars 20)
+          (transient-mark-mode t)
+          (mark-active t))
+      (cl-letf (((symbol-function 'codex--directory)
+                 (lambda () "/tmp/project/")))
+        (let ((context (codex--format-context)))
+          (should (string-match-p "- Region: 1-11 (10 chars)" context))
+          (should-not (string-match-p "Selected text:" context))
+          (should-not (string-match-p "short text" context)))))))
+
 (ert-deftest codex-test-terminal-mode-has-shift-return-binding ()
   (should (equal codex-shift-return-sequence "\C-j"))
   (should (eq (lookup-key codex-terminal-mode-map (kbd "S-<return>"))
