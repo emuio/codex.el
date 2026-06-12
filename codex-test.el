@@ -165,32 +165,85 @@
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
-(ert-deftest codex-test-dashboard-format-buffer-without-process ()
+(ert-deftest codex-test-dashboard-row-buffer-without-process ()
   (let ((buffer (get-buffer-create (codex--buffer-name "/tmp/project/"))))
     (unwind-protect
         (progn
           (with-current-buffer buffer
             (setq-local codex--session-directory "/tmp/project/"))
-          (let ((line (codex--format-dashboard-line
-                       (list :type 'buffer :buffer buffer))))
-            (should (string-match-p "\\bbuffer\\b" line))
-            (should (string-match-p "\\bdefault\\b" line))
-            (should (string-match-p "\\bproject\\b" line))
-            (should (string-match-p "\\bno-process\\b" line))))
+          (let ((row (codex--dashboard-entry-vector
+                      (list :type 'buffer :buffer buffer)
+                      "12:34:56")))
+            (should (equal (aref row 0) "buffer"))
+            (should (equal (aref row 1) "default"))
+            (should (equal (aref row 2) "project"))
+            (should (equal (aref row 3) "no-process"))
+            (should (equal (aref row 4) "12:34:56"))
+            (should (equal (aref row 6) "/tmp/project/"))))
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
-(ert-deftest codex-test-dashboard-format-tmux-entry ()
-  (let ((line (codex--format-dashboard-line
-               (list :type 'tmux
-                     :session "testgit"
-                     :directory "/Users/emuio/git/TestGit"
-                     :command "node"))))
-    (should (string-match-p "\\btmux\\b" line))
-    (should (string-match-p "\\btestgit\\b" line))
-    (should (string-match-p "\\bTestGit\\b" line))
-    (should (string-match-p "\\bdetected\\b" line))
-    (should (string-match-p "\\bnode\\b" line))))
+(ert-deftest codex-test-dashboard-row-tmux-entry ()
+  (cl-letf (((symbol-function 'codex--tmux-capture-preview)
+             (lambda (_session)
+               "last terminal line")))
+    (let ((row (codex--dashboard-entry-vector
+                (list :type 'tmux
+                      :session "testgit"
+                      :directory "/Users/emuio/git/TestGit"
+                      :command "node")
+                "12:34:56")))
+      (should (equal (aref row 0) "tmux"))
+      (should (equal (aref row 1) "testgit"))
+      (should (equal (aref row 2) "TestGit"))
+      (should (equal (aref row 3) "tmux-live"))
+      (should (equal (aref row 4) "12:34:56"))
+      (should (equal (aref row 5) "last terminal line"))
+      (should (equal (aref row 6) "/Users/emuio/git/TestGit")))))
+
+(ert-deftest codex-test-dashboard-clean-preview-collapses-and-truncates ()
+  (let ((codex-dashboard-preview-width 12))
+    (should (equal (codex--dashboard-clean-preview
+                    " \tfirst\nsecond   line with more text ")
+                   "first second..."))))
+
+(ert-deftest codex-test-tmux-capture-preview-uses-bounded-capture ()
+  (let ((codex-dashboard-preview-lines 8)
+        (captured-args nil))
+    (cl-letf (((symbol-function 'codex--process-file-lines)
+               (lambda (program &rest args)
+                 (setq captured-args (cons program args))
+                 '("first line" "" "last line"))))
+      (should (equal (codex--tmux-capture-preview "testgit") "last line"))
+      (should (equal captured-args
+                     (list codex-tmux-program
+                           "capture-pane" "-p" "-J"
+                           "-S" "-8"
+                           "-t" "testgit"))))))
+
+(ert-deftest codex-test-tmux-capture-preview-returns-nil-without-output ()
+  (cl-letf (((symbol-function 'codex--process-file-lines)
+             (lambda (_program &rest _args)
+               nil)))
+    (should-not (codex--tmux-capture-preview "testgit"))))
+
+(ert-deftest codex-test-dashboard-buffer-preview-falls-back-after-empty-tmux-capture ()
+  (let ((buffer (get-buffer-create " *codex-dashboard-preview-test*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (insert "older line\nfallback line\n"))
+          (cl-letf (((symbol-function 'codex--buffer-tmux-session)
+                     (lambda (_buffer)
+                       "testgit"))
+                    ((symbol-function 'codex--tmux-capture-preview)
+                     (lambda (_session)
+                       "")))
+            (should (equal (codex--dashboard-entry-preview
+                            (list :type 'buffer :buffer buffer))
+                           "older line fallback line"))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
 
 (ert-deftest codex-test-dashboard-entries-include-external-tmux-without-duplicates ()
   (let* ((internal-dir "/tmp/internal/")
