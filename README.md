@@ -15,6 +15,7 @@ session reuse, and a simple dashboard.
 - Run Codex inside `tmux` by default so sessions can survive SSH disconnects.
 - Attach external tmux sessions that are already running Codex.
 - Manage live buffers and detected tmux sessions with `M-x codex-dashboard`.
+- Open a focused command menu with `M-x codex-menu` when `transient` is available.
 - Send a region, buffer, or one-line command to a running Codex session.
 - Enter tmux copy-mode from Emacs without typing the tmux prefix key.
 - Send Shift+Enter as a Codex CLI multiline-input newline in Codex terminal buffers.
@@ -26,6 +27,7 @@ session reuse, and a simple dashboard.
 - `vterm`
 - `tmux` when `codex-use-tmux` is enabled
 - Optional: `eat` when `codex-backend` is set to `eat`
+- Optional: `transient` for `codex-menu`
 
 The package does not manage Codex authentication. Run `codex login` in a normal
 terminal first, then `codex.el` will reuse that CLI login state.
@@ -51,6 +53,7 @@ Common commands:
 
 | Command | Description |
 | --- | --- |
+| `codex-menu` | Open a focused `transient` menu for common Codex commands. |
 | `codex` | Start or switch to a Codex session for the current project. |
 | `codex-dashboard` | Show live Codex buffers and detected Codex tmux sessions. |
 | `codex-resume-last` | Run `codex resume --last` in the current project. |
@@ -63,6 +66,7 @@ With the example `C-c d` prefix above:
 
 | Key | Command |
 | --- | --- |
+| `C-c d m` | `codex-menu` |
 | `C-c d c` | `codex` |
 | `C-c d d` | `codex-dashboard` |
 | `C-c d R` | `codex-resume-last` |
@@ -71,6 +75,9 @@ With the example `C-c d` prefix above:
 | `C-c d s` | `codex-send-command` |
 | `C-c d [` | `codex-tmux-copy-mode` |
 | `C-c d p` | `codex-tmux-copy-mode` |
+
+`codex-menu` loads `transient` lazily and signals a `user-error` if it is not
+installed; other commands keep working without it.
 
 Inside a Codex terminal buffer, `Shift+Enter` sends the same newline sequence as
 `Ctrl+j`, which Codex CLI uses for multiline input in the composer.

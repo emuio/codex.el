@@ -157,6 +157,36 @@ same terminal newline."
 (defvar-local codex--tmux-target-session nil
   "tmux session associated with the current Codex buffer.")
 
+(defun codex--ensure-transient-menu ()
+  "Return the transient prefix command used by `codex-menu'."
+  (unless (require 'transient nil t)
+    (user-error "codex-menu requires the transient package"))
+  (unless (fboundp 'codex--menu)
+    (eval
+     '(transient-define-prefix codex--menu ()
+        "Open the Codex command menu."
+        [["Sessions"
+          ("c" "Start" codex)
+          ("d" "Dashboard" codex-dashboard)
+          ("R" "Resume last" codex-resume-last)
+          ("u" "Yolo" codex-yolo)]
+         ["Send"
+          ("r" "Region or buffer" codex-send-region)
+          ("s" "Command" codex-send-command)]
+         ["Buffers"
+          ("b" "Switch buffer" codex-switch-to-buffer)
+          ("k" "Kill" codex-kill)]
+         ["Tools"
+          ("l" "Login status" codex-login-status)
+          ("p" "tmux copy mode" codex-tmux-copy-mode)]])))
+  'codex--menu)
+
+;;;###autoload
+(defun codex-menu ()
+  "Open a transient menu for common Codex commands."
+  (interactive)
+  (call-interactively (codex--ensure-transient-menu)))
+
 ;;;###autoload (autoload 'codex-command-map "codex")
 (defvar codex-command-map nil
   "Keymap for Codex commands.")
@@ -170,6 +200,7 @@ same terminal newline."
   (define-key codex-command-map "d" #'codex-dashboard)
   (define-key codex-command-map "k" #'codex-kill)
   (define-key codex-command-map "l" #'codex-login-status)
+  (define-key codex-command-map "m" #'codex-menu)
   (define-key codex-command-map "p" #'codex-tmux-copy-mode)
   (define-key codex-command-map "r" #'codex-send-region)
   (define-key codex-command-map "R" #'codex-resume-last)
