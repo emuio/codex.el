@@ -1035,14 +1035,19 @@ DIRECTORY, MODE, and INSTANCE-NAME are passed to `codex--start-session'."
   "Display a message when no Codex session is available."
   (message "No Codex session running"))
 
-(defun codex--display-buffer (buffer)
-  "Display Codex BUFFER according to `codex-display-full-frame'."
-  (if codex-display-full-frame
+(defun codex--display-buffer (buffer &optional selected-window)
+  "Display Codex BUFFER according to `codex-display-full-frame'.
+
+When SELECTED-WINDOW is non-nil, show BUFFER in the selected window without
+deleting other windows."
+  (if selected-window
+      (switch-to-buffer buffer)
+    (if codex-display-full-frame
       (progn
         (switch-to-buffer buffer)
         (delete-other-windows)
         (selected-window))
-    (display-buffer buffer)))
+      (display-buffer buffer))))
 
 (defun codex--terminal-send-string (string)
   "Send STRING and RET to the terminal in the current Codex buffer."
@@ -1281,7 +1286,7 @@ intercepts `C-b ['."
         (user-error "tmux copy-mode failed for %s"
                     target-session)))
     (when buffer
-      (codex--display-buffer buffer))))
+      (codex--display-buffer buffer t))))
 
 ;;;###autoload
 (defun codex-capture-transcript (&optional arg)
@@ -1612,15 +1617,17 @@ UPDATED is the dashboard snapshot timestamp shown in the row."
   (interactive)
   (when-let* ((entry (codex-dashboard-get-entry-at-point))
               (buffer (codex--dashboard-entry-buffer entry)))
-    (codex-dashboard-quit)
-    (codex--display-buffer buffer)))
+    (let ((dashboard-buffer (current-buffer)))
+      (codex--display-buffer buffer t)
+      (when (buffer-live-p dashboard-buffer)
+        (kill-buffer dashboard-buffer)))))
 
 (defun codex-dashboard-preview ()
   "Preview the Codex instance at point."
   (interactive)
   (when-let* ((entry (codex-dashboard-get-entry-at-point))
               (buffer (codex--dashboard-entry-buffer entry)))
-    (codex--display-buffer buffer)))
+    (codex--display-buffer buffer t)))
 
 (defun codex-dashboard-kill-instance ()
   "Kill the Codex instance at point."

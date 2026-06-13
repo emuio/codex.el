@@ -486,5 +486,92 @@
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
+(ert-deftest codex-test-display-buffer-can-use-selected-window ()
+  (let ((buffer (get-buffer-create " *codex-display-current-window-test*")))
+    (unwind-protect
+        (progn
+          (delete-other-windows)
+          (split-window-right)
+          (codex--display-buffer buffer t)
+          (should (eq (window-buffer (selected-window)) buffer))
+          (should (= (length (window-list)) 2)))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer))
+      (delete-other-windows))))
+
+(ert-deftest codex-test-dashboard-select-preserves-selected-window ()
+  (let ((dashboard-buffer (get-buffer-create " *codex-dashboard-select-test*"))
+        (target-buffer (get-buffer-create " *codex-dashboard-target-test*")))
+    (unwind-protect
+        (progn
+          (delete-other-windows)
+          (with-current-buffer dashboard-buffer
+            (erase-buffer)
+            (insert "entry")
+            (add-text-properties
+             (point-min) (point-max)
+             (list 'codex-dashboard-entry
+                   (list :type 'buffer :buffer target-buffer)))
+            (goto-char (point-min)))
+          (switch-to-buffer dashboard-buffer)
+          (split-window-right)
+          (select-window (get-buffer-window dashboard-buffer))
+          (codex-dashboard-select)
+          (should (eq (window-buffer (selected-window)) target-buffer))
+          (should (= (length (window-list)) 2)))
+      (when (buffer-live-p dashboard-buffer)
+        (kill-buffer dashboard-buffer))
+      (when (buffer-live-p target-buffer)
+        (kill-buffer target-buffer))
+      (delete-other-windows))))
+
+(ert-deftest codex-test-dashboard-preview-preserves-selected-window ()
+  (let ((dashboard-buffer (get-buffer-create " *codex-dashboard-preview-window-test*"))
+        (target-buffer (get-buffer-create " *codex-dashboard-preview-target-test*")))
+    (unwind-protect
+        (progn
+          (delete-other-windows)
+          (with-current-buffer dashboard-buffer
+            (erase-buffer)
+            (insert "entry")
+            (add-text-properties
+             (point-min) (point-max)
+             (list 'codex-dashboard-entry
+                   (list :type 'buffer :buffer target-buffer)))
+            (goto-char (point-min)))
+          (switch-to-buffer dashboard-buffer)
+          (split-window-right)
+          (select-window (get-buffer-window dashboard-buffer))
+          (codex-dashboard-preview)
+          (should (eq (window-buffer (selected-window)) target-buffer))
+          (should (= (length (window-list)) 2)))
+      (when (buffer-live-p dashboard-buffer)
+        (kill-buffer dashboard-buffer))
+      (when (buffer-live-p target-buffer)
+        (kill-buffer target-buffer))
+      (delete-other-windows))))
+
+(ert-deftest codex-test-tmux-copy-mode-preserves-window-layout ()
+  (let ((buffer (get-buffer-create (codex--buffer-name "/tmp/project/" "copy"))))
+    (unwind-protect
+        (progn
+          (delete-other-windows)
+          (switch-to-buffer buffer)
+          (with-current-buffer buffer
+            (setq-local codex--session-directory "/tmp/project/")
+            (setq-local codex--session-instance "copy")
+            (setq-local codex--tmux-target-session "codex-project-copy"))
+          (split-window-right)
+          (cl-letf (((symbol-function 'codex--ensure-tmux) #'ignore)
+                    ((symbol-function 'process-file)
+                     (lambda (&rest _args) 0)))
+            (let ((codex-use-tmux t))
+              (codex-tmux-copy-mode)))
+          (should (eq (window-buffer (selected-window)) buffer))
+          (should (= (length (window-list)) 2)))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer))
+      (delete-other-windows))))
+
 (provide 'codex-test)
 ;;; codex-test.el ends here
