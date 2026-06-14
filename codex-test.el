@@ -297,6 +297,42 @@
       (when (buffer-live-p target-buffer)
         (kill-buffer target-buffer)))))
 
+(ert-deftest codex-test-dashboard-kill-buffer-entry-kills-associated-tmux-session ()
+  (let ((dashboard-buffer (get-buffer-create " *codex-dashboard-kill-test*"))
+        (target-buffer (get-buffer-create " *codex-dashboard-kill-target*"))
+        (process-args nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer dashboard-buffer
+            (erase-buffer)
+            (insert "entry")
+            (add-text-properties
+             (point-min) (point-max)
+             (list 'codex-dashboard-entry
+                   (list :type 'buffer :buffer target-buffer)))
+            (goto-char (point-min)))
+          (cl-letf (((symbol-function 'codex--buffer-tmux-session)
+                     (lambda (_buffer) "codex-project-work"))
+                    ((symbol-function 'yes-or-no-p)
+                     (lambda (_prompt) t))
+                    ((symbol-function 'process-file)
+                     (lambda (&rest args)
+                       (setq process-args args)
+                       0))
+                    ((symbol-function 'codex-dashboard-refresh)
+                     #'ignore))
+            (with-current-buffer dashboard-buffer
+              (codex-dashboard-kill-instance)))
+          (should-not (buffer-live-p target-buffer))
+          (should (equal process-args
+                         (list codex-tmux-program
+                               nil nil nil
+                               "kill-session" "-t" "codex-project-work"))))
+      (when (buffer-live-p dashboard-buffer)
+        (kill-buffer dashboard-buffer))
+      (when (buffer-live-p target-buffer)
+        (kill-buffer target-buffer)))))
+
 (ert-deftest codex-test-dashboard-clean-preview-collapses-and-truncates ()
   (let ((codex-dashboard-preview-width 12))
     (should (equal (codex--dashboard-clean-preview

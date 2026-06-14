@@ -1869,26 +1869,38 @@ UPDATED is the dashboard snapshot timestamp shown in the row."
     (codex--clear-dashboard-entry-notification entry)
     (codex--display-buffer buffer t)))
 
+(defun codex--kill-tmux-session (session)
+  "Kill tmux SESSION or signal a user error."
+  (let ((exit-code (process-file codex-tmux-program
+                                 nil nil nil
+                                 "kill-session" "-t" session)))
+    (unless (and (integerp exit-code) (zerop exit-code))
+      (user-error "tmux kill-session failed for %s" session))))
+
 (defun codex-dashboard-kill-instance ()
   "Kill the Codex instance at point."
   (interactive)
   (when-let ((entry (codex-dashboard-get-entry-at-point)))
     (pcase (plist-get entry :type)
       ('buffer
-       (let ((buffer (plist-get entry :buffer)))
+       (let* ((buffer (plist-get entry :buffer))
+              (session (and (buffer-live-p buffer)
+                            (codex--buffer-tmux-session buffer))))
          (when (yes-or-no-p
-                (format "Kill Codex buffer %s? " (buffer-name buffer)))
+                (if session
+                    (format "Kill Codex buffer %s and tmux session %s? "
+                            (buffer-name buffer)
+                            session)
+                  (format "Kill Codex buffer %s? " (buffer-name buffer))))
+           (when session
+             (codex--kill-tmux-session session))
            (kill-buffer buffer)
            (codex-dashboard-refresh))))
       ('tmux
        (let ((session (plist-get entry :session)))
          (when (yes-or-no-p
                 (format "Kill tmux session %s? " session))
-           (let ((exit-code (process-file codex-tmux-program
-                                          nil nil nil
-                                          "kill-session" "-t" session)))
-             (unless (and (integerp exit-code) (zerop exit-code))
-               (user-error "tmux kill-session failed for %s" session)))
+           (codex--kill-tmux-session session)
            (codex-dashboard-refresh)))))))
 
 (defun codex-dashboard-quit ()
