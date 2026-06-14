@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""Forward Codex legacy notify payloads into Emacs, then chain the old notifier."""
+
+import json
+import os
+import subprocess
+import sys
+
+
+ENV_TO_METADATA = {
+    "CODEX_EL_TMUX_SESSION": "tmux-session",
+    "CODEX_EL_BUFFER_NAME": "buffer-name",
+    "CODEX_EL_DIRECTORY": "directory",
+    "CODEX_EL_INSTANCE": "instance",
+}
+
+
+def parse_args(argv):
+    previous_notify = None
+    rest = []
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--previous-notify" and index + 1 < len(argv):
+            previous_notify = argv[index + 1]
+            index += 2
+        else:
+            rest.append(arg)
+            index += 1
+
+    payload = rest[-1] if rest else ""
+    return previous_notify, payload
+
+
+def elisp_string(value):
+    return json.dumps(value or "", ensure_ascii=True)
+
+
+def notify_emacs(payload):
+    emacsclient = os.environ.get("CODEX_EL_EMACSCLIENT", "emacsclient")
+    metadata = {
+        metadata_key: os.environ[env_key]
+        for env_key, metadata_key in ENV_TO_METADATA.items()
+        if os.environ.get(env_key)
+    }
+    metadata_json = json.dumps(metadata, separators=(",", ":"), ensure_ascii=True)
+    expr = (
+        "(progn "
+        "(require 'codex nil t) "
+        "(when (fboundp 'codex-notify-agent-turn-complete-json) "
+        "(codex-notify-agent-turn-complete-json "
+        f"{elisp_string(payload)} {elisp_string(metadata_json)})))"
+    )
+
+    timeout = float(os.environ.get("CODEX_EL_EMACSCLIENT_TIMEOUT", "2"))
+    try:
+        subprocess.run(
+            [emacsclient, "--eval", expr],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
+        )
+    except Exception:
+        pass
+
+
+def chain_previous(previous_notify, payload):
+    if not previous_notify:
+        return
+    try:
+        previous_argv = json.loads(previous_notify)
+    except Exception:
+        return
+    if not isinstance(previous_argv, list) or not previous_argv:
+        return
+    if not all(isinstance(arg, str) for arg in previous_argv):
+        return
+    try:
+        subprocess.Popen(
+            previous_argv + [payload],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
+def main(argv):
+    previous_notify, payload = parse_args(argv)
+    notify_emacs(payload)
+    chain_previous(previous_notify, payload)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

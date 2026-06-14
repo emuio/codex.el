@@ -41,7 +41,8 @@
 
 (ert-deftest codex-test-vterm-command-string-shell-quotes ()
   (let ((codex-program "codex")
-        (codex-program-switches '("--search")))
+        (codex-program-switches '("--search"))
+        (codex-notify-inject-session-environment nil))
     (should (equal (codex--vterm-command-string "/tmp/project dir/" nil)
                    "codex --search --cd /tmp/project\\ dir/"))))
 
@@ -49,12 +50,42 @@
   (let ((codex-program "codex")
         (codex-program-switches '("--search"))
         (codex-tmux-program "tmux")
-        (codex-tmux-session-prefix "codex"))
+        (codex-tmux-session-prefix "codex")
+        (codex-notify-inject-session-environment nil))
     (should (equal (codex--tmux-command-string "/tmp/project dir/" nil)
                    (concat "tmux new-session -A -s "
                            (codex--tmux-session-name "/tmp/project dir/")
                            " -c /tmp/project\\ dir/ "
                            "codex\\ --search\\ --cd\\ /tmp/project\\\\\\ dir/")))))
+
+(ert-deftest codex-test-vterm-command-injects-notify-session-environment ()
+  (let ((codex-program "codex")
+        (codex-program-switches nil)
+        (codex-tmux-session-prefix "codex")
+        (codex-notify-inject-session-environment t))
+    (let ((command (codex--vterm-command-string "/tmp/project dir/" nil "work")))
+      (should (string-prefix-p "env " command))
+      (should (string-match-p
+               (regexp-quote
+                (shell-quote-argument
+                 "CODEX_EL_DIRECTORY=/tmp/project dir/"))
+               command))
+      (should (string-match-p
+               (regexp-quote
+                (shell-quote-argument "CODEX_EL_INSTANCE=work"))
+               command))
+      (should (string-match-p
+               (regexp-quote
+                (shell-quote-argument
+                 (format "CODEX_EL_TMUX_SESSION=%s"
+                         (codex--tmux-session-name "/tmp/project dir/" "work"))))
+               command))
+      (should (string-match-p
+               (regexp-quote
+                (shell-quote-argument
+                 (format "CODEX_EL_BUFFER_NAME=%s"
+                         (codex--buffer-name "/tmp/project dir/" "work"))))
+               command)))))
 
 (ert-deftest codex-test-tmux-copy-mode-args-target-session ()
   (let ((codex-tmux-program "tmux"))
@@ -178,8 +209,9 @@
             (should (equal (aref row 1) "default"))
             (should (equal (aref row 2) "project"))
             (should (equal (aref row 3) "no-process"))
-            (should (equal (aref row 4) "12:34:56"))
-            (should (equal (aref row 6) "/tmp/project/"))))
+            (should (equal (aref row 4) ""))
+            (should (equal (aref row 5) "12:34:56"))
+            (should (equal (aref row 7) "/tmp/project/"))))
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
@@ -197,9 +229,73 @@
       (should (equal (aref row 1) "testgit"))
       (should (equal (aref row 2) "TestGit"))
       (should (equal (aref row 3) "tmux-live"))
-      (should (equal (aref row 4) "12:34:56"))
-      (should (equal (aref row 5) "last terminal line"))
-      (should (equal (aref row 6) "/Users/emuio/git/TestGit")))))
+      (should (equal (aref row 4) ""))
+      (should (equal (aref row 5) "12:34:56"))
+      (should (equal (aref row 6) "last terminal line"))
+      (should (equal (aref row 7) "/Users/emuio/git/TestGit")))))
+
+(ert-deftest codex-test-notify-json-marks-dashboard-entry-done ()
+  (clrhash codex--notification-events)
+  (unwind-protect
+      (let* ((metadata-json
+              "{\"tmux-session\":\"codex-project-work\",\"buffer-name\":\"*codex:/tmp/project/:work*\",\"directory\":\"/tmp/project/\",\"instance\":\"work\"}")
+             (payload-json
+              "{\"type\":\"agent-turn-complete\",\"thread-id\":\"thread-1\",\"turn-id\":\"turn-1\",\"cwd\":\"/tmp/project/\",\"last-assistant-message\":\"Implementation finished.\"}")
+             (entry (list :type 'tmux
+                          :session "codex-project-work"
+                          :directory "/tmp/project/"))
+             (row nil))
+        (codex-notify-agent-turn-complete-json payload-json metadata-json)
+        (setq row (codex--dashboard-entry-vector entry "12:34:56"))
+        (should (equal (aref row 4) "done!"))
+        (should (equal (aref row 6) "Implementation finished.")))
+    (clrhash codex--notification-events)))
+
+(ert-deftest codex-test-notify-json-falls-back-to-cwd-for-external-session ()
+  (clrhash codex--notification-events)
+  (unwind-protect
+      (let* ((payload-json
+              "{\"type\":\"agent-turn-complete\",\"thread-id\":\"thread-1\",\"turn-id\":\"turn-1\",\"cwd\":\"/tmp/project/\",\"last-assistant-message\":\"Done from cwd.\"}")
+             (entry (list :type 'tmux
+                          :session "external"
+                          :directory "/tmp/project/")))
+        (codex-notify-agent-turn-complete-json payload-json)
+        (should (equal (codex--dashboard-entry-turn-state entry) "done!"))
+        (should (equal (codex--dashboard-entry-preview entry) "Done from cwd.")))
+    (clrhash codex--notification-events)))
+
+(ert-deftest codex-test-dashboard-select-clears-notify-state ()
+  (clrhash codex--notification-events)
+  (let ((dashboard-buffer (get-buffer-create " *codex-dashboard-notify-test*"))
+        (target-buffer (get-buffer-create " *codex-dashboard-notify-target*"))
+        (entry (list :type 'tmux
+                     :session "codex-project-work"
+                     :directory "/tmp/project/")))
+    (unwind-protect
+        (progn
+          (puthash "tmux:codex-project-work"
+                   (list :last-assistant-message "Done")
+                   codex--notification-events)
+          (with-current-buffer dashboard-buffer
+            (erase-buffer)
+            (insert "entry")
+            (add-text-properties
+             (point-min) (point-max)
+             (list 'codex-dashboard-entry entry))
+            (goto-char (point-min)))
+          (cl-letf (((symbol-function 'codex--dashboard-entry-buffer)
+                     (lambda (_entry) target-buffer))
+                    ((symbol-function 'codex--display-buffer)
+                     (lambda (_buffer &optional _selected-window) nil)))
+            (with-current-buffer dashboard-buffer
+              (codex-dashboard-select)))
+          (should-not (gethash "tmux:codex-project-work"
+                               codex--notification-events)))
+      (clrhash codex--notification-events)
+      (when (buffer-live-p dashboard-buffer)
+        (kill-buffer dashboard-buffer))
+      (when (buffer-live-p target-buffer)
+        (kill-buffer target-buffer)))))
 
 (ert-deftest codex-test-dashboard-clean-preview-collapses-and-truncates ()
   (let ((codex-dashboard-preview-width 12))
@@ -431,7 +527,8 @@
 (ert-deftest codex-test-vterm-entry-command-can-skip-tmux ()
   (let ((codex-use-tmux nil)
         (codex-program "codex")
-        (codex-program-switches nil))
+        (codex-program-switches nil)
+        (codex-notify-inject-session-environment nil))
     (should (equal (codex--vterm-entry-command-string
                     "/tmp/project dir/" nil)
                    "codex --cd /tmp/project\\ dir/"))))

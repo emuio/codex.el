@@ -16,6 +16,7 @@
 
 (require 'cl-lib)
 (require 'diff-mode)
+(require 'json)
 (require 'project)
 (require 'subr-x)
 (require 'tabulated-list)
@@ -25,11 +26,13 @@
 (defvar eat--synchronize-scroll-function)
 (declare-function eat-make "eat")
 (declare-function eat-term-send-string "eat")
+(declare-function notifications-notify "notifications" (&rest params))
 (declare-function vterm-mode "vterm")
 (declare-function vterm-copy-mode "vterm")
 (declare-function vterm-send-return "vterm")
 (declare-function vterm-send-string "vterm")
 (declare-function magit-status "magit" (&optional directory))
+(defvar codex-dashboard-buffer-name)
 (defvar vterm-max-scrollback)
 
 (defgroup codex nil
@@ -179,6 +182,21 @@ same terminal newline."
   :type 'integer
   :group 'codex)
 
+(defcustom codex-notify-inject-session-environment t
+  "When non-nil, pass codex.el session metadata to Codex notify hooks."
+  :type 'boolean
+  :group 'codex)
+
+(defcustom codex-notify-show-messages t
+  "When non-nil, show Codex turn completion events in the echo area."
+  :type 'boolean
+  :group 'codex)
+
+(defcustom codex-notify-use-system-notifications t
+  "When non-nil, use Emacs system notifications for Codex turn completion."
+  :type 'boolean
+  :group 'codex)
+
 (defcustom codex-tmux-codex-command-regexp
   "\\(?:\\`\\|[ /]\\)codex\\(?:[[:space:]]\\|\\'\\)"
   "Regexp used to detect Codex commands in tmux pane process trees."
@@ -190,6 +208,9 @@ same terminal newline."
 
 (defvar codex--buffer-trim-timers (make-hash-table :test 'eq)
   "Debounce timers for Codex buffer trimming.")
+
+(defvar codex--notification-events (make-hash-table :test 'equal)
+  "Codex turn completion notifications keyed by dashboard identity.")
 
 (defvar-local codex--session-directory nil
   "Directory associated with the current Codex buffer.")
@@ -336,11 +357,13 @@ MODE may be nil, `:yolo', or `:resume-last'."
      codex-yolo-switches)
    (list "--cd" (codex--normalize-directory directory))))
 
-(defun codex--vterm-command-string (directory mode)
+(defun codex--vterm-command-string (directory mode &optional instance-name)
   "Build the shell command used to start Codex in vterm."
-  (mapconcat #'shell-quote-argument
-             (cons codex-program (codex--command-switches directory mode))
-             " "))
+  (codex--command-with-environment
+   (mapconcat #'shell-quote-argument
+              (cons codex-program (codex--command-switches directory mode))
+              " ")
+   (codex--notify-session-environment directory instance-name)))
 
 (defun codex--sanitize-tmux-session-part (value)
   "Return VALUE as a tmux-session-safe string fragment."
@@ -370,6 +393,31 @@ MODE may be nil, `:yolo', or `:resume-last'."
      (delq nil (list prefix project instance hash))
      "-")))
 
+(defun codex--notify-session-environment (directory &optional instance-name)
+  "Return environment assignments identifying a Codex session."
+  (when codex-notify-inject-session-environment
+    (let* ((dir (codex--normalize-directory directory))
+           (session (when codex-use-tmux
+                      (codex--tmux-session-name dir instance-name)))
+           (buffer-name (codex--buffer-name dir instance-name)))
+      (delq nil
+            (list (format "CODEX_EL_DIRECTORY=%s" dir)
+                  (when (and instance-name
+                             (not (string-empty-p instance-name)))
+                    (format "CODEX_EL_INSTANCE=%s" instance-name))
+                  (when session
+                    (format "CODEX_EL_TMUX_SESSION=%s" session))
+                  (format "CODEX_EL_BUFFER_NAME=%s" buffer-name))))))
+
+(defun codex--command-with-environment (command environment)
+  "Return shell COMMAND prefixed with ENVIRONMENT assignments."
+  (if environment
+      (concat "env "
+              (mapconcat #'shell-quote-argument environment " ")
+              " "
+              command)
+    command))
+
 (defun codex--tmux-command-string (directory mode &optional instance-name)
   "Build the shell command used to attach or create a Codex tmux session."
   (mapconcat #'shell-quote-argument
@@ -380,7 +428,7 @@ MODE may be nil, `:yolo', or `:resume-last'."
                    (codex--tmux-session-name directory instance-name)
                    "-c"
                    (codex--normalize-directory directory)
-                   (codex--vterm-command-string directory mode))
+                   (codex--vterm-command-string directory mode instance-name))
              " "))
 
 (defun codex--tmux-copy-mode-args (directory &optional instance-name)
@@ -564,7 +612,7 @@ PROCESSES should be the output of `codex--list-processes'."
   "Build the command sent to vterm for DIRECTORY, MODE, and INSTANCE-NAME."
   (if codex-use-tmux
       (codex--tmux-command-string directory mode instance-name)
-    (codex--vterm-command-string directory mode)))
+    (codex--vterm-command-string directory mode instance-name)))
 
 (defun codex--ensure-program ()
   "Signal a user error unless `codex-program' is executable."
@@ -950,11 +998,12 @@ DIRECTORY is the working directory.  MODE is passed to
    directory
    (codex--vterm-entry-command-string directory mode instance-name)))
 
-(defun codex--start-eat-in-buffer (buffer-name directory mode)
+(defun codex--start-eat-in-buffer (buffer-name directory mode &optional instance-name)
   "Start Codex in the current buffer using eat.
 
 BUFFER-NAME is the display name passed to `eat-make'.  DIRECTORY is the
-working directory.  MODE is passed to `codex--command-switches'."
+working directory.  MODE is passed to `codex--command-switches'.
+INSTANCE-NAME identifies this session for Codex notify hooks."
   (codex--ensure-eat)
   (cd directory)
   (setq-local eat-term-name codex-term-name)
@@ -964,7 +1013,10 @@ working directory.  MODE is passed to `codex--command-switches'."
     (setq-local eat-enable-shell-command-history nil))
   (when (boundp 'eat-enable-shell-prompt-annotation)
     (setq-local eat-enable-shell-prompt-annotation nil))
-  (let ((process-adaptive-read-buffering nil))
+  (let ((process-adaptive-read-buffering nil)
+        (process-environment
+         (append (codex--notify-session-environment directory instance-name)
+                 process-environment)))
     (condition-case err
         (apply #'eat-make
                buffer-name
@@ -990,7 +1042,8 @@ working directory.  MODE is passed to `codex--command-switches'."
                     (codex--tmux-session-name dir instance-name)))
       (pcase codex-backend
         ('vterm (codex--start-vterm-in-buffer dir mode instance-name))
-        ('eat (codex--start-eat-in-buffer trimmed-buffer-name dir mode))
+        ('eat (codex--start-eat-in-buffer
+               trimmed-buffer-name dir mode instance-name))
         (_ (user-error "Unsupported Codex backend: %S" codex-backend)))
       (codex--setup-repl-faces)
       (add-hook 'after-change-functions #'codex--on-buffer-change nil t)
@@ -1040,6 +1093,7 @@ DIRECTORY, MODE, and INSTANCE-NAME are passed to `codex--start-session'."
 
 When SELECTED-WINDOW is non-nil, show BUFFER in the selected window without
 deleting other windows."
+  (codex--clear-buffer-notification buffer)
   (if selected-window
       (switch-to-buffer buffer)
     (if codex-display-full-frame
@@ -1336,6 +1390,136 @@ When Magit is not available, show `git diff' for the project instead."
         (message "%s" (string-trim output))
       (user-error "codex login status failed: %s" (string-trim output)))))
 
+(defun codex--notify-json-read (json)
+  "Read JSON as a plist, returning nil for blank input."
+  (when (and (stringp json)
+             (not (string-empty-p json)))
+    (let ((json-object-type 'plist)
+          (json-array-type 'list)
+          (json-key-type 'keyword))
+      (json-read-from-string json))))
+
+(defun codex--notify-string (plist key)
+  "Return string value for KEY in PLIST."
+  (let ((value (plist-get plist key)))
+    (when (stringp value)
+      value)))
+
+(defun codex--notify-directory-key (directory)
+  "Return notification hash key for DIRECTORY."
+  (when (and directory
+             (not (string-empty-p directory)))
+    (concat "dir:" (codex--normalize-directory directory))))
+
+(defun codex--notify-tmux-key (session)
+  "Return notification hash key for tmux SESSION."
+  (when (and session
+             (not (string-empty-p session)))
+    (concat "tmux:" session)))
+
+(defun codex--notify-buffer-key (buffer-name)
+  "Return notification hash key for BUFFER-NAME."
+  (when (and buffer-name
+             (not (string-empty-p buffer-name)))
+    (concat "buffer:" buffer-name)))
+
+(defun codex--notify-thread-key (thread-id)
+  "Return notification hash key for THREAD-ID."
+  (when (and thread-id
+             (not (string-empty-p thread-id)))
+    (concat "thread:" thread-id)))
+
+(defun codex--notify-event-from-json (payload-json &optional metadata-json)
+  "Return a Codex notification event from PAYLOAD-JSON and METADATA-JSON."
+  (let* ((payload (codex--notify-json-read payload-json))
+         (metadata (codex--notify-json-read metadata-json))
+         (cwd (codex--notify-string payload :cwd))
+         (directory (or (codex--notify-string metadata :directory) cwd)))
+    (list :type (codex--notify-string payload :type)
+          :thread-id (codex--notify-string payload :thread-id)
+          :turn-id (codex--notify-string payload :turn-id)
+          :cwd cwd
+          :directory directory
+          :tmux-session (codex--notify-string metadata :tmux-session)
+          :buffer-name (codex--notify-string metadata :buffer-name)
+          :instance (codex--notify-string metadata :instance)
+          :last-assistant-message
+          (codex--notify-string payload :last-assistant-message)
+          :notified-at (current-time))))
+
+(defun codex--notify-event-storage-keys (event)
+  "Return hash keys used to store notification EVENT."
+  (let* ((buffer-name (plist-get event :buffer-name))
+         (tmux-session (plist-get event :tmux-session))
+         (specific-keys
+          (delq nil
+                (list (codex--notify-buffer-key buffer-name)
+                      (codex--notify-tmux-key tmux-session))))
+         (fallback-key
+          (unless specific-keys
+            (codex--notify-directory-key
+             (or (plist-get event :directory)
+                 (plist-get event :cwd))))))
+    (delete-dups
+     (delq nil
+           (append (list (codex--notify-thread-key
+                          (plist-get event :thread-id)))
+                   specific-keys
+                   (list fallback-key))))))
+
+(defun codex--notify-project-label (event)
+  "Return a short project/session label for notification EVENT."
+  (or (plist-get event :instance)
+      (when-let ((directory (or (plist-get event :directory)
+                                (plist-get event :cwd))))
+        (codex--dashboard-project-name directory))
+      (plist-get event :tmux-session)
+      "Codex"))
+
+(defun codex--notify-message-text (event)
+  "Return echo-area text for notification EVENT."
+  (let ((summary (plist-get event :last-assistant-message)))
+    (if (and summary (not (string-empty-p summary)))
+        (format "Codex: %s finished - %s"
+                (codex--notify-project-label event)
+                (codex--dashboard-clean-preview summary))
+      (format "Codex: %s finished"
+              (codex--notify-project-label event)))))
+
+(defun codex--notify-display-event (event)
+  "Display user-visible notification for EVENT."
+  (when codex-notify-show-messages
+    (message "%s" (codex--notify-message-text event)))
+  (when (and codex-notify-use-system-notifications
+             (display-graphic-p)
+             (require 'notifications nil t))
+    (notifications-notify
+     :title "Codex turn finished"
+     :body (codex--notify-message-text event))))
+
+(defun codex--notify-refresh-dashboard ()
+  "Refresh an open Codex dashboard after notification changes."
+  (when-let ((buffer (get-buffer codex-dashboard-buffer-name)))
+    (with-current-buffer buffer
+      (when (derived-mode-p 'codex-dashboard-mode)
+        (tabulated-list-print t)
+        (codex--dashboard-insert-footer)))))
+
+;;;###autoload
+(defun codex-notify-agent-turn-complete-json (payload-json &optional metadata-json)
+  "Record a Codex agent turn completion notification.
+
+PAYLOAD-JSON is the legacy Codex notify payload appended to the configured
+notifier argv.  METADATA-JSON is optional codex.el session metadata supplied by
+the notify bridge."
+  (interactive "sCodex notify payload JSON: ")
+  (let ((event (codex--notify-event-from-json payload-json metadata-json)))
+    (dolist (key (codex--notify-event-storage-keys event))
+      (puthash key event codex--notification-events))
+    (codex--notify-display-event event)
+    (codex--notify-refresh-dashboard)
+    event))
+
 (defvar codex-dashboard-buffer-name "*Codex Dashboard*"
   "Name of the Codex dashboard buffer.")
 
@@ -1371,6 +1555,7 @@ When Magit is not available, show `git diff' for the project instead."
          ("Instance/Session" 24 t)
          ("Project" 18 t)
          ("TermState" 14 t)
+         ("Turn" 10 t)
          ("Updated" 10 t)
          ("Preview" 80 t)
          ("Directory" 48 t)])
@@ -1510,6 +1695,56 @@ When Magit is not available, show `git diff' for the project instead."
      (or (plist-get entry :directory) ""))
     (_ "")))
 
+(defun codex--dashboard-entry-notify-keys (entry)
+  "Return notification hash keys that may identify dashboard ENTRY."
+  (delete-dups
+   (delq nil
+         (pcase (plist-get entry :type)
+           ('buffer
+            (let* ((buffer (plist-get entry :buffer))
+                   (buffer-name (and (buffer-live-p buffer)
+                                     (buffer-name buffer)))
+                   (session (and (buffer-live-p buffer)
+                                 (codex--buffer-tmux-session buffer)))
+                   (directory (codex--dashboard-entry-directory entry)))
+              (list (codex--notify-buffer-key buffer-name)
+                    (codex--notify-tmux-key session)
+                    (codex--notify-directory-key directory))))
+           ('tmux
+            (list (codex--notify-tmux-key (plist-get entry :session))
+                  (codex--notify-directory-key
+                   (codex--dashboard-entry-directory entry))))
+           (_ nil)))))
+
+(defun codex--dashboard-entry-notification (entry)
+  "Return the notification event associated with dashboard ENTRY."
+  (cl-some (lambda (key)
+             (gethash key codex--notification-events))
+           (codex--dashboard-entry-notify-keys entry)))
+
+(defun codex--dashboard-entry-turn-state (entry)
+  "Return the Codex turn notification state for dashboard ENTRY."
+  (if (codex--dashboard-entry-notification entry)
+      "done!"
+    ""))
+
+(defun codex--dashboard-entry-notify-preview (entry)
+  "Return notification preview text for dashboard ENTRY, if any."
+  (when-let* ((event (codex--dashboard-entry-notification entry))
+              (message (plist-get event :last-assistant-message)))
+    (codex--dashboard-clean-preview message)))
+
+(defun codex--clear-dashboard-entry-notification (entry)
+  "Clear stored notification state for dashboard ENTRY."
+  (dolist (key (codex--dashboard-entry-notify-keys entry))
+    (remhash key codex--notification-events)))
+
+(defun codex--clear-buffer-notification (buffer)
+  "Clear stored notification state for Codex BUFFER."
+  (when (and buffer (buffer-live-p buffer) (codex--codex-buffer-p buffer))
+    (codex--clear-dashboard-entry-notification
+     (list :type 'buffer :buffer buffer))))
+
 (defun codex--dashboard-entry-term-state (entry)
   "Return the TermState column text for dashboard ENTRY."
   (pcase (plist-get entry :type)
@@ -1520,18 +1755,20 @@ When Magit is not available, show `git diff' for the project instead."
 
 (defun codex--dashboard-entry-preview (entry)
   "Return the Preview column text for dashboard ENTRY."
-  (pcase (plist-get entry :type)
-    ('buffer
-     (let* ((buffer (plist-get entry :buffer))
-            (session (and (buffer-live-p buffer)
-                          (codex--buffer-tmux-session buffer)))
-            (tmux-preview (and session (codex--tmux-capture-preview session))))
-       (or (codex--dashboard-nonempty-preview tmux-preview)
-           (codex--buffer-tail-preview buffer)
-           "")))
-    ('tmux
-     (or (codex--tmux-capture-preview (plist-get entry :session)) ""))
-    (_ "")))
+  (or (codex--dashboard-entry-notify-preview entry)
+      (pcase (plist-get entry :type)
+        ('buffer
+         (let* ((buffer (plist-get entry :buffer))
+                (session (and (buffer-live-p buffer)
+                              (codex--buffer-tmux-session buffer)))
+                (tmux-preview (and session
+                                   (codex--tmux-capture-preview session))))
+           (or (codex--dashboard-nonempty-preview tmux-preview)
+               (codex--buffer-tail-preview buffer)
+               "")))
+        ('tmux
+         (or (codex--tmux-capture-preview (plist-get entry :session)) ""))
+        (_ ""))))
 
 (defun codex--dashboard-entry-vector (entry &optional updated)
   "Return a tabulated-list vector for dashboard ENTRY.
@@ -1544,6 +1781,7 @@ UPDATED is the dashboard snapshot timestamp shown in the row."
      (codex--dashboard-entry-instance entry)
      (codex--dashboard-project-name directory)
      (codex--dashboard-entry-term-state entry)
+     (codex--dashboard-entry-turn-state entry)
      updated
      (codex--dashboard-entry-preview entry)
      directory)))
@@ -1574,7 +1812,7 @@ UPDATED is the dashboard snapshot timestamp shown in the row."
   "Insert dashboard help text below the tabulated rows."
   (let ((inhibit-read-only t))
     (goto-char (point-max))
-    (insert "\nTerminal/process state, not model turn state.")
+    (insert "\nTurn state comes from Codex notify events; terminal state is separate.")
     (insert "\nRET select/attach  TAB preview  k kill  r/g refresh  q quit\n")))
 
 (defun codex-dashboard-get-entry-at-point ()
@@ -1618,6 +1856,7 @@ UPDATED is the dashboard snapshot timestamp shown in the row."
   (when-let* ((entry (codex-dashboard-get-entry-at-point))
               (buffer (codex--dashboard-entry-buffer entry)))
     (let ((dashboard-buffer (current-buffer)))
+      (codex--clear-dashboard-entry-notification entry)
       (codex--display-buffer buffer t)
       (when (buffer-live-p dashboard-buffer)
         (kill-buffer dashboard-buffer)))))
@@ -1627,6 +1866,7 @@ UPDATED is the dashboard snapshot timestamp shown in the row."
   (interactive)
   (when-let* ((entry (codex-dashboard-get-entry-at-point))
               (buffer (codex--dashboard-entry-buffer entry)))
+    (codex--clear-dashboard-entry-notification entry)
     (codex--display-buffer buffer t)))
 
 (defun codex-dashboard-kill-instance ()
